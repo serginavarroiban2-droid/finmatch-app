@@ -12,6 +12,7 @@ const supabase = createClient(
   import.meta.env.VITE_SUPABASE_URL,
   import.meta.env.VITE_SUPABASE_ANON_KEY
 );
+
 const TOLERANCIA = 0.05;
 
 export default function ReconciliationTool() {
@@ -27,7 +28,7 @@ export default function ReconciliationTool() {
   const [selectedBankIdx, setSelectedBankIdx] = useState(null);
   const [showPaired, setShowPaired] = useState(true);
 
-  // Noms de columna fixes (Segons els teus fitxers)
+  // Noms de columna fixes
   const COL_FAC_DATA = "DATA";
   const COL_FAC_NUM = "ULTIMA 4 DIGITS NUMERO FACTURA";
   const COL_FAC_PROV = "PROVEEDOR";
@@ -37,87 +38,91 @@ export default function ReconciliationTool() {
   const COL_BANK_DESC = "Concepto";
   const COL_BANK_IMPORT = "Importe";
 
-  // --- PERSISTÈNCIA SUPABASE ---
-useEffect(() => {
-  const fetchData = async () => {
-    const { data } = await supabase.from('registres_comptables').select('*');
-    if (data) {
-      const facturesData = data.filter(d => d.tipus === 'factura');
-      const bancData = data.filter(d => d.tipus === 'banc');
-      
-      // Carregar factures i moviments
-      const invoicesList = facturesData.map(d => d.contingut);
-      const bankList = bancData.map(d => d.contingut);
-      
-      setInvoices(invoicesList);
-      setBankData(bankList);
-      
-      // Reconstruir matches, cash i exclusions
-      const newMatches = {};
-      const newCash = new Set();
-      const newExclusions = new Set();
-      
-      facturesData.forEach((rec, idx) => {
-        if (rec.estat_conciliacio === 'conciliat' && rec.conciliat_amb) {
-          // Trobar l'índex del moviment bancari
-          const bankIdx = bancData.findIndex(b => getRecordHash(b.contingut, 'banc') === rec.conciliat_amb);
-          if (bankIdx !== -1) {
-            newMatches[idx] = bankIdx;
-          }
-        } else if (rec.estat_conciliacio === 'cash') {
-          newCash.add(idx);
-        }
-      });
-      
-      bancData.forEach((rec, idx) => {
-        if (rec.estat_conciliacio === 'exclos') {
-          newExclusions.add(idx);
-        }
-      });
-      
-      setMatches(newMatches);
-      setInvoiceCash(newCash);
-      setBankExclusions(newExclusions);
-    }
+  // --- FUNCIÓ PER CREAR HASH ÚNIC ---
+  const getRecordHash = (item, tipus) => {
+    const dateStr = tipus === 'factura' ? item[COL_FAC_DATA] : item[COL_BANK_DATA];
+    const amount = tipus === 'factura' ? item[COL_FAC_TOTAL] : item[COL_BANK_IMPORT];
+    const uniqueString = `${tipus}-${dateStr}-${amount}`;
+    return btoa(uniqueString).substring(0, 50);
   };
-  fetchData();
-}, []);
-// Funció per crear hash únic d'un registre
-const getRecordHash = (item, tipus) => {
-  const dateStr = tipus === 'factura' ? item[COL_FAC_DATA] : item[COL_BANK_DATA];
-  const amount = tipus === 'factura' ? item[COL_FAC_TOTAL] : item[COL_BANK_IMPORT];
-  const uniqueString = `${tipus}-${dateStr}-${amount}`;
-  return btoa(uniqueString).substring(0, 50);
-};
 
-const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliatAmb = null) => {
-  const dateStr = tipus === 'factura' ? item[COL_FAC_DATA] : item[COL_BANK_DATA];
-  const year = getYear(dateStr);
-  const quarter = getQuarter(dateStr);
-  
-  if (year > 2000) {
-    const uniqueHash = getRecordHash(item, tipus);
+  // --- PERSISTÈNCIA SUPABASE AMB ESTAT ---
+  const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliatAmb = null) => {
+    const dateStr = tipus === 'factura' ? item[COL_FAC_DATA] : item[COL_BANK_DATA];
+    const year = getYear(dateStr);
+    const quarter = getQuarter(dateStr);
     
-    try {
-      await supabase.from('registres_comptables').upsert(
-        [{ 
-          tipus, 
-          contingut: item, 
-          ejercicio: year, 
-          trimestre: quarter,
-          unique_hash: uniqueHash,
-          estat_conciliacio: estatConciliacio,
-          conciliat_amb: conciliatAmb
-        }],
-        { onConflict: 'unique_hash' }
-      );
-    } catch (error) {
-      if (error.code !== '23505') {
-        console.error('Error guardant a Supabase:', error);
+    if (year > 2000) {
+      const uniqueHash = getRecordHash(item, tipus);
+      
+      try {
+        await supabase.from('registres_comptables').upsert(
+          [{ 
+            tipus, 
+            contingut: item, 
+            ejercicio: year, 
+            trimestre: quarter,
+            unique_hash: uniqueHash,
+            estat_conciliacio: estatConciliacio,
+            conciliat_amb: conciliatAmb
+          }],
+          { onConflict: 'unique_hash' }
+        );
+      } catch (error) {
+        if (error.code !== '23505') {
+          console.error('Error guardant a Supabase:', error);
+        }
       }
     }
-  }
-};  // --- UTILS DATA ---
+  };
+
+  // --- CARREGAR DADES I RECONSTRUIR ESTAT ---
+  useEffect(() => {
+    const fetchData = async () => {
+      const { data } = await supabase.from('registres_comptables').select('*');
+      if (data) {
+        const facturesData = data.filter(d => d.tipus === 'factura');
+        const bancData = data.filter(d => d.tipus === 'banc');
+        
+        // Carregar factures i moviments
+        const invoicesList = facturesData.map(d => d.contingut);
+        const bankList = bancData.map(d => d.contingut);
+        
+        setInvoices(invoicesList);
+        setBankData(bankList);
+        
+        // Reconstruir matches, cash i exclusions
+        const newMatches = {};
+        const newCash = new Set();
+        const newExclusions = new Set();
+        
+        facturesData.forEach((rec, idx) => {
+          if (rec.estat_conciliacio === 'conciliat' && rec.conciliat_amb) {
+            // Trobar l'índex del moviment bancari
+            const bankIdx = bankList.findIndex(b => getRecordHash(b, 'banc') === rec.conciliat_amb);
+            if (bankIdx !== -1) {
+              newMatches[idx] = bankIdx;
+            }
+          } else if (rec.estat_conciliacio === 'cash') {
+            newCash.add(idx);
+          }
+        });
+        
+        bancData.forEach((rec, idx) => {
+          if (rec.estat_conciliacio === 'exclos') {
+            newExclusions.add(idx);
+          }
+        });
+        
+        setMatches(newMatches);
+        setInvoiceCash(newCash);
+        setBankExclusions(newExclusions);
+      }
+    };
+    fetchData();
+  }, []);
+
+  // --- UTILS DATA ---
   const getQuarter = (d) => {
     if (!d || typeof d !== 'string' || (!d.includes('/') && !d.includes('-'))) return -1;
     const cleanD = d.trim().replace(/-/g, '/');
@@ -157,7 +162,6 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
     });
   }, [bankData, selectedQuarters, selectedYear]);
 
-  // Resum filtrat per la finestra de conciliades
   const filteredMatchesList = useMemo(() => {
     return Object.entries(matches).filter(([invIdx]) => {
       const d = invoices[invIdx][COL_FAC_DATA];
@@ -173,14 +177,14 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
   }, [invoiceCash, invoices, selectedYear, selectedQuarters]);
 
   // --- CONCILIACIÓ AUTOMÀTICA AMB RESUM ---
-  const handleAutoReconcile = () => {
+  const handleAutoReconcile = async () => {
     const newMatches = { ...matches };
     const usedBank = new Set([...Object.values(matches), ...bankExclusions]);
     let trobadesNoves = 0;
 
-    filteredInvoices.forEach(inv => {
+    for (const inv of filteredInvoices) {
       const rIdx = invoices.indexOf(inv);
-      if (newMatches[rIdx] || invoiceCash.has(rIdx)) return;
+      if (newMatches[rIdx] || invoiceCash.has(rIdx)) continue;
       
       const amt = parseAmount(inv[COL_FAC_TOTAL]);
       const bIdx = bankData.findIndex((b, j) => !usedBank.has(j) && Math.abs(amt - parseAmount(b[COL_BANK_IMPORT])) <= TOLERANCIA);
@@ -189,12 +193,17 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
         newMatches[rIdx] = bIdx;
         usedBank.add(bIdx);
         trobadesNoves++;
+        
+        // Guardar a Supabase
+        const bankHash = getRecordHash(bankData[bIdx], 'banc');
+        const invHash = getRecordHash(inv, 'factura');
+        await syncSupabase('factura', inv, 'conciliat', bankHash);
+        await syncSupabase('banc', bankData[bIdx], 'conciliat', invHash);
       }
-    });
+    }
 
     setMatches(newMatches);
 
-    // Càlcul de totals pel missatge informatiu
     const totalVisibles = filteredInvoices.length;
     const jaConciliades = filteredInvoices.filter(inv => {
         const idx = invoices.indexOf(inv);
@@ -214,7 +223,8 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
       complete: (r) => {
         const news = r.data.map(obj => {
           Object.keys(obj).forEach(k => obj[k] = typeof obj[k] === 'string' ? obj[k].trim() : obj[k]);
-          syncSupabase('factura', obj); return obj;
+          syncSupabase('factura', obj); 
+          return obj;
         });
         setInvoices(prev => [...prev, ...news]);
       }
@@ -230,8 +240,10 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
       if (hIdx !== -1) {
         const h = rows[hIdx].map(x => String(x).trim());
         const news = rows.slice(hIdx + 1).filter(r => r.some(c => String(c).trim() !== "")).map(r => {
-          const obj = {}; h.forEach((col, i) => obj[col] = String(r[i] || "").trim());
-          syncSupabase('banc', obj); return obj;
+          const obj = {}; 
+          h.forEach((col, i) => obj[col] = String(r[i] || "").trim());
+          syncSupabase('banc', obj); 
+          return obj;
         });
         setBankData(prev => [...prev, ...news]);
       }
@@ -250,7 +262,8 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
   };
 
   const totalSelected = useMemo(() => {
-    let sum = 0; selectedInvIndices.forEach(idx => sum += parseAmount(invoices[idx]?.[COL_FAC_TOTAL]));
+    let sum = 0; 
+    selectedInvIndices.forEach(idx => sum += parseAmount(invoices[idx]?.[COL_FAC_TOTAL]));
     return sum;
   }, [selectedInvIndices, invoices]);
 
@@ -258,9 +271,9 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
     <div className="w-full min-h-screen bg-slate-100 p-2 font-sans text-[11px]">
       <iframe id="ifmcontentstoprint" className="hidden" title="print"></iframe>
 
-      {/* HEADER FIXA (STICKY) */}
+      {/* HEADER FIXA */}
       <div className="sticky top-0 z-50 w-full bg-white p-4 rounded-b-xl shadow-md mb-4 border-b flex items-center gap-4 no-print flex-wrap">
-        <h1 className="text-xl font-black text-indigo-700 italic border-r pr-4 uppercase tracking-tighter">FinMatch v6</h1>
+        <h1 className="text-xl font-black text-indigo-700 italic border-r pr-4 uppercase tracking-tighter">FinMatch v7</h1>
         
         <div className="flex gap-1 bg-slate-50 p-1 rounded-lg border items-center">
           <Calendar size={14} className="text-slate-400 mx-1"/>
@@ -283,30 +296,15 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
           <Play size={12} fill="currentColor" /> Conciliar Auto
         </button>
 
-        <button onClick={async () => {
-  const nm = {...matches}; 
-  
-  // Guardar cada conciliació a Supabase
-  for (const invIdx of selectedInvIndices) {
-    nm[invIdx] = selectedBankIdx;
-    
-    // Actualitzar factura
-    const invoice = invoices[invIdx];
-    const bankRecord = bankData[selectedBankIdx];
-    const bankHash = getRecordHash(bankRecord, 'banc');
-    await syncSupabase('factura', invoice, 'conciliat', bankHash);
-    
-    // Actualitzar moviment bancari
-    const invHash = getRecordHash(invoice, 'factura');
-    await syncSupabase('banc', bankRecord, 'conciliat', invHash);
-  }
-  
-  setMatches(nm); 
-  setSelectedInvIndices(new Set()); 
-  setSelectedBankIdx(null);
-  
-  alert('✅ Conciliació guardada!');
-}} ...> className="p-2 bg-slate-800 text-white rounded hover:bg-black flex items-center gap-1 ml-auto transition-colors"><HardDriveDownload size={14}/> Backup</button>
+        <button onClick={() => {
+          const blob = new Blob([JSON.stringify({invoices, bankData, matches, invoiceCash: Array.from(invoiceCash)}, null, 2)], {type: 'application/json'});
+          const a = document.createElement('a'); 
+          a.href = URL.createObjectURL(blob); 
+          a.download = `backup_${selectedYear}.json`; 
+          a.click();
+        }} className="p-2 bg-slate-800 text-white rounded hover:bg-black flex items-center gap-1 ml-auto transition-colors">
+          <HardDriveDownload size={14}/> Backup
+        </button>
       </div>
 
       {/* BARRA SELECCIÓ MANUAL */}
@@ -329,27 +327,56 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
             )}
           </div>
           <div className="flex gap-3">
-            <button onClick={() => {
-              const nm = {...matches}; selectedInvIndices.forEach(idx => nm[idx] = selectedBankIdx);
-              setMatches(nm); setSelectedInvIndices(new Set()); setSelectedBankIdx(null);
-            }} disabled={selectedInvIndices.size === 0 || selectedBankIdx === null} className="bg-emerald-600 text-white px-10 py-3 rounded-2xl font-black uppercase shadow-lg hover:bg-emerald-700 transition">Vincular</button>
-            <button onClick={() => {setSelectedInvIndices(new Set()); setSelectedBankIdx(null)}} className="bg-white text-amber-800 font-bold px-5 py-3 rounded-2xl border-2 border-amber-200 shadow-sm"><RotateCcw size={20}/></button>
+            <button onClick={async () => {
+              const nm = {...matches}; 
+              
+              // Guardar cada conciliació a Supabase
+              for (const invIdx of selectedInvIndices) {
+                nm[invIdx] = selectedBankIdx;
+                
+                const invoice = invoices[invIdx];
+                const bankRecord = bankData[selectedBankIdx];
+                const bankHash = getRecordHash(bankRecord, 'banc');
+                const invHash = getRecordHash(invoice, 'factura');
+                
+                await syncSupabase('factura', invoice, 'conciliat', bankHash);
+                await syncSupabase('banc', bankRecord, 'conciliat', invHash);
+              }
+              
+              setMatches(nm); 
+              setSelectedInvIndices(new Set()); 
+              setSelectedBankIdx(null);
+            }} disabled={selectedInvIndices.size === 0 || selectedBankIdx === null} className="bg-emerald-600 text-white px-10 py-3 rounded-2xl font-black uppercase shadow-lg hover:bg-emerald-700 transition disabled:opacity-50">
+              Vincular
+            </button>
+            <button onClick={() => {setSelectedInvIndices(new Set()); setSelectedBankIdx(null)}} className="bg-white text-amber-800 font-bold px-5 py-3 rounded-2xl border-2 border-amber-200 shadow-sm">
+              <RotateCcw size={20}/>
+            </button>
           </div>
         </div>
       )}
 
-      {/* TAULES GRID (ESTIRABLES) */}
+      {/* TAULES GRID */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
         {/* FACTURES */}
         <div id="win-factures" style={{ resize: 'vertical', height: '600px' }} className="bg-white rounded-xl shadow border flex flex-col overflow-auto min-h-[300px]">
           <div className="p-3 bg-slate-800 text-white flex justify-between items-center no-print sticky top-0 z-20">
              <span className="font-bold ml-2 uppercase text-[10px] tracking-widest">Factures Pendents ({filteredInvoices.length})</span>
-             <button onClick={() => printSection('win-factures', 'Llistat de Factures')} className="p-1 hover:bg-slate-700 rounded transition"><Printer size={16} /></button>
+             <button onClick={() => printSection('win-factures', 'Llistat de Factures')} className="p-1 hover:bg-slate-700 rounded transition">
+               <Printer size={16} />
+             </button>
           </div>
           <div className="flex-1">
             <table className="w-full text-left">
               <thead className="bg-gray-50 sticky top-10 border-b z-10 font-bold uppercase text-gray-400 text-[9px]">
-                <tr><th className="p-2">Data</th><th className="p-2">Últims 4 Núm.</th><th className="p-2">Proveïdor</th><th className="p-2 text-right">Import</th><th className="p-2 text-center">OK</th><th className="p-2 text-center no-print w-12">Cash</th></tr>
+                <tr>
+                  <th className="p-2">Data</th>
+                  <th className="p-2">Últims 4 Núm.</th>
+                  <th className="p-2">Proveïdor</th>
+                  <th className="p-2 text-right">Import</th>
+                  <th className="p-2 text-center">OK</th>
+                  <th className="p-2 text-center no-print w-12">Cash</th>
+                </tr>
               </thead>
               <tbody>
                 {filteredInvoices.map((inv, i) => {
@@ -358,7 +385,11 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
                   const isCash = invoiceCash.has(rIdx);
                   const isOK = isMatched || isCash;
                   return (
-                    <tr key={i} onClick={() => !isOK && setSelectedInvIndices(prev => {const n=new Set(prev); n.has(rIdx)?n.delete(rIdx):n.add(rIdx); return n;})} 
+                    <tr key={i} onClick={() => !isOK && setSelectedInvIndices(prev => {
+                      const n=new Set(prev); 
+                      n.has(rIdx)?n.delete(rIdx):n.add(rIdx); 
+                      return n;
+                    })} 
                         className={`border-b cursor-pointer transition-all ${isOK ? 'bg-emerald-50 text-emerald-700 opacity-60' : selectedInvIndices.has(rIdx) ? 'bg-amber-100 ring-2 ring-inset ring-amber-300' : 'hover:bg-gray-50'}`}>
                       <td className="p-2 text-gray-400 font-mono">{inv[COL_FAC_DATA]}</td>
                       <td className="p-2 font-bold">{inv[COL_FAC_NUM] || '-'}</td>
@@ -369,21 +400,24 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
                       </td>
                       <td className="p-2 text-center no-print">
                         {!isMatched && (
-                          <<button onClick={async (e) => { 
-  e.stopPropagation(); 
-  const n = new Set(invoiceCash);
-  const adding = !n.has(rIdx);
-  
-  if (adding) {
-    n.add(rIdx);
-    await syncSupabase('factura', inv, 'cash', null);
-  } else {
-    n.delete(rIdx);
-    await syncSupabase('factura', inv, 'pendent', null);
-  }
-  
-  setInvoiceCash(n); 
-}} ...>                          className={`p-1.5 rounded-full transition-colors ${isCash?'bg-emerald-200 text-emerald-700 border-2 border-emerald-400':'text-gray-300 hover:text-emerald-500'}`}><Banknote size={16}/></button>
+                          <button onClick={async (e) => { 
+                            e.stopPropagation(); 
+                            const n = new Set(invoiceCash);
+                            const adding = !n.has(rIdx);
+                            
+                            if (adding) {
+                              n.add(rIdx);
+                              await syncSupabase('factura', inv, 'cash', null);
+                            } else {
+                              n.delete(rIdx);
+                              await syncSupabase('factura', inv, 'pendent', null);
+                            }
+                            
+                            setInvoiceCash(n); 
+                          }} 
+                          className={`p-1.5 rounded-full transition-colors ${isCash?'bg-emerald-200 text-emerald-700 border-2 border-emerald-400':'text-gray-300 hover:text-emerald-500'}`}>
+                            <Banknote size={16}/>
+                          </button>
                         )}
                       </td>
                     </tr>
@@ -398,12 +432,19 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
         <div id="win-banc" style={{ resize: 'vertical', height: '600px' }} className="bg-white rounded-xl shadow border flex flex-col overflow-auto min-h-[300px]">
           <div className="p-3 bg-indigo-900 text-white flex justify-between items-center no-print text-[10px] sticky top-0 z-20">
             <span className="font-bold ml-2 uppercase tracking-widest">Extracte Bancari ({filteredBank.length})</span>
-            <button onClick={() => printSection('win-banc', 'Extracte Bancari')} className="p-1 hover:bg-indigo-800 rounded transition"><Printer size={16} /></button>
+            <button onClick={() => printSection('win-banc', 'Extracte Bancari')} className="p-1 hover:bg-indigo-800 rounded transition">
+              <Printer size={16} />
+            </button>
           </div>
           <div className="flex-1 text-[9px]">
             <table className="w-full text-left">
               <thead className="bg-gray-50 sticky top-10 border-b z-10 text-gray-400 font-bold uppercase">
-                <tr><th className="p-2">Data</th><th className="p-2">Moviment</th><th className="p-2 text-right">Import</th><th className="p-2 text-center no-print w-12">SF</th></tr>
+                <tr>
+                  <th className="p-2">Data</th>
+                  <th className="p-2">Moviment</th>
+                  <th className="p-2 text-right">Import</th>
+                  <th className="p-2 text-center no-print w-12">SF</th>
+                </tr>
               </thead>
               <tbody>
                 {filteredBank.map((row, i) => {
@@ -418,20 +459,23 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
                       <td className="p-2 text-center no-print">
                         {!isUsed && (
                           <button onClick={async (e) => {
-  e.stopPropagation(); 
-  const n = new Set(bankExclusions);
-  const adding = !n.has(rIdx);
-  
-  if (adding) {
-    n.add(rIdx);
-    await syncSupabase('banc', row, 'exclos', null);
-  } else {
-    n.delete(rIdx);
-    await syncSupabase('banc', row, 'pendent', null);
-  }
-  
-  setBankExclusions(n); 
-}} ...>                          className={`p-1.5 rounded-full transition-colors ${isEx?'bg-emerald-200 text-emerald-700 border-2 border-emerald-400':'text-gray-300 hover:text-emerald-500'}`}><BookmarkCheck size={16}/></button>
+                            e.stopPropagation(); 
+                            const n = new Set(bankExclusions);
+                            const adding = !n.has(rIdx);
+                            
+                            if (adding) {
+                              n.add(rIdx);
+                              await syncSupabase('banc', row, 'exclos', null);
+                            } else {
+                              n.delete(rIdx);
+                              await syncSupabase('banc', row, 'pendent', null);
+                            }
+                            
+                            setBankExclusions(n); 
+                          }} 
+                          className={`p-1.5 rounded-full transition-colors ${isEx?'bg-emerald-200 text-emerald-700 border-2 border-emerald-400':'text-gray-300 hover:text-emerald-500'}`}>
+                            <BookmarkCheck size={16}/>
+                          </button>
                         )}
                       </td>
                     </tr>
@@ -443,20 +487,32 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
         </div>
       </div>
 
-      {/* RESUM (ESTIRABLE) */}
+      {/* RESUM */}
       <div id="win-paired" style={{ resize: 'vertical', height: '350px' }} className="w-full bg-white rounded-xl shadow-2xl border-2 border-emerald-300 overflow-auto mb-12 min-h-[150px] flex flex-col">
         <div className="p-3 bg-emerald-600 text-white flex justify-between items-center no-print sticky top-0 z-20">
-          <span className="font-black ml-2 uppercase text-[10px] tracking-widest text-white">Resum de Factures Conciliades (Sincronitzat amb Filtres)</span>
+          <span className="font-black ml-2 uppercase text-[10px] tracking-widest text-white">Resum de Factures Conciliades</span>
           <div className="flex gap-4 items-center">
-            <button onClick={() => printSection('win-paired', 'Informe de Factures Conciliades')} className="p-1.5 hover:bg-emerald-500 rounded-full text-white bg-emerald-700 shadow-inner transition"><Printer size={18} /></button>
-            <button onClick={() => setShowPaired(!showPaired)} className="p-1 text-white hover:bg-emerald-500 rounded-full"><ChevronDown size={24} className={showPaired ? 'rotate-180' : ''}/></button>
+            <button onClick={() => printSection('win-paired', 'Informe de Factures Conciliades')} className="p-1.5 hover:bg-emerald-500 rounded-full text-white bg-emerald-700 shadow-inner transition">
+              <Printer size={18} />
+            </button>
+            <button onClick={() => setShowPaired(!showPaired)} className="p-1 text-white hover:bg-emerald-500 rounded-full">
+              <ChevronDown size={24} className={showPaired ? 'rotate-180' : ''}/>
+            </button>
           </div>
         </div>
         {showPaired && (
           <div className="flex-1">
             <table className="w-full text-left text-[9px] border-collapse">
               <thead className="bg-emerald-50 sticky top-10 border-b font-bold uppercase text-emerald-800 z-10">
-                <tr><th className="p-2 w-16 text-center">Tipus</th><th className="p-2 w-20">Data Fac</th><th className="p-2">Proveïdor</th><th className="p-2 text-right border-r">Import Fac.</th><th className="p-2 pl-4">Banc / Alerta</th><th className="p-2 text-right">Import Banc</th><th className="p-2 no-print text-center w-14">Acció</th></tr>
+                <tr>
+                  <th className="p-2 w-16 text-center">Tipus</th>
+                  <th className="p-2 w-20">Data Fac</th>
+                  <th className="p-2">Proveïdor</th>
+                  <th className="p-2 text-right border-r">Import Fac.</th>
+                  <th className="p-2 pl-4">Banc / Alerta</th>
+                  <th className="p-2 text-right">Import Banc</th>
+                  <th className="p-2 no-print text-center w-14">Acció</th>
+                </tr>
               </thead>
               <tbody>
                 {filteredCashList.map(idx => (
@@ -466,7 +522,16 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
                     <td className="p-2">{invoices[idx][COL_FAC_PROV]}</td>
                     <td className="p-2 text-right font-black border-r border-emerald-100">{invoices[idx][COL_FAC_TOTAL]}€</td>
                     <td className="p-2 pl-4 text-gray-400 italic" colSpan="2">Pagament realitzat fora de circuit bancari</td>
-                    <td className="p-2 text-center no-print"><button onClick={() => { const n = new Set(invoiceCash); n.delete(idx); setInvoiceCash(n); }} className="text-rose-500 hover:bg-rose-100 p-1.5 rounded-full transition-colors"><XCircle size={18}/></button></td>
+                    <td className="p-2 text-center no-print">
+                      <button onClick={async () => { 
+                        const n = new Set(invoiceCash); 
+                        n.delete(idx); 
+                        setInvoiceCash(n);
+                        await syncSupabase('factura', invoices[idx], 'pendent', null);
+                      }} className="text-rose-500 hover:bg-rose-100 p-1.5 rounded-full transition-colors">
+                        <XCircle size={18}/>
+                      </button>
+                    </td>
                   </tr>
                 ))}
                 {filteredMatchesList.map(([invIdx, bIdx]) => {
@@ -487,17 +552,19 @@ const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliat
                         <span className="italic text-gray-500 truncate max-w-xs">{String(bankData[bIdx][COL_BANK_DESC])}</span>
                       </td>
                       <td className="p-2 text-right font-black text-rose-700">{bankData[bIdx][COL_BANK_IMPORT]}€</td>
-                      <td className="p-2 text-center no-print"><button onClick={async () => { 
-  const n = {...matches}; 
-  const bankIdx = n[invIdx];
-  delete n[invIdx]; 
-  
-  // Actualitzar estat a pendent
-  await syncSupabase('factura', invoices[invIdx], 'pendent', null);
-  await syncSupabase('banc', bankData[bankIdx], 'pendent', null);
-  
-  setMatches(n); 
-}} ...> className="text-rose-500 hover:bg-rose-100 p-1.5 rounded-full transition-colors"><Unlink size={18}/></button></td>
+                      <td className="p-2 text-center no-print">
+                        <button onClick={async () => { 
+                          const n={...matches}; 
+                          const bankIdx = n[invIdx];
+                          delete n[invIdx]; 
+                          setMatches(n);
+                          
+                          await syncSupabase('factura', invoices[invIdx], 'pendent', null);
+                          await syncSupabase('banc', bankData[bankIdx], 'pendent', null);
+                        }} className="text-rose-500 hover:bg-rose-100 p-1.5 rounded-full transition-colors">
+                          <Unlink size={18}/>
+                        </button>
+                      </td>
                     </tr>
                   );
                 })}
