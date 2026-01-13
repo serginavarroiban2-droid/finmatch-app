@@ -7,7 +7,6 @@ import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
 import { createClient } from '@supabase/supabase-js';
 
-// --- CONFIGURACIÓ SUPABASE ---
 const supabase = createClient(
   import.meta.env.VITE_SUPABASE_URL,
   import.meta.env.VITE_SUPABASE_ANON_KEY
@@ -28,7 +27,6 @@ export default function ReconciliationTool() {
   const [selectedBankIdx, setSelectedBankIdx] = useState(null);
   const [showPaired, setShowPaired] = useState(true);
 
-  // Noms de columna fixes
   const COL_FAC_DATA = "DATA";
   const COL_FAC_NUM = "ULTIMA 4 DIGITS NUMERO FACTURA";
   const COL_FAC_PROV = "PROVEEDOR";
@@ -38,16 +36,16 @@ export default function ReconciliationTool() {
   const COL_BANK_DESC = "Concepto";
   const COL_BANK_IMPORT = "Importe";
 
-  // --- FUNCIÓ PER CREAR HASH ÚNIC ---
+  // HASH per identificar registres
   const getRecordHash = (item, tipus) => {
     const dateStr = tipus === 'factura' ? item[COL_FAC_DATA] : item[COL_BANK_DATA];
     const amount = tipus === 'factura' ? item[COL_FAC_TOTAL] : item[COL_BANK_IMPORT];
-    const uniqueString = `${tipus}-${dateStr}-${amount}`;
-    return btoa(uniqueString).substring(0, 50);
+    const desc = tipus === 'factura' ? item[COL_FAC_PROV] : item[COL_BANK_DESC];
+    return btoa(`${tipus}-${dateStr}-${amount}-${desc}`).substring(0, 100);
   };
 
-  // --- PERSISTÈNCIA SUPABASE AMB ESTAT ---
-  const syncSupabase = async (tipus, item, estatConciliacio = 'pendent', conciliatAmb = null) => {
+  // GUARDAR registre a Supabase
+  const syncSupabase = async (tipus, item) => {
     const dateStr = tipus === 'factura' ? item[COL_FAC_DATA] : item[COL_BANK_DATA];
     const year = getYear(dateStr);
     const quarter = getQuarter(dateStr);
@@ -62,67 +60,118 @@ export default function ReconciliationTool() {
             contingut: item, 
             ejercicio: year, 
             trimestre: quarter,
-            unique_hash: uniqueHash,
-            estat_conciliacio: estatConciliacio,
-            conciliat_amb: conciliatAmb
+            unique_hash: uniqueHash
           }],
           { onConflict: 'unique_hash' }
         );
       } catch (error) {
         if (error.code !== '23505') {
-          console.error('Error guardant a Supabase:', error);
+          console.error('Error guardant:', error);
         }
       }
     }
   };
 
-  // --- CARREGAR DADES I RECONSTRUIR ESTAT ---
+  // GUARDAR conciliació
+  const saveConciliacio = async (facturaHash, bancHash = null, tipus = 'banc') => {
+    try {
+      await supabase.from('conciliacions').upsert(
+        [{
+          factura_hash: facturaHash,
+          banc_hash: bancHash,
+          tipus_conciliacio: tipus
+        }],
+        { onConflict: 'factura_hash' }
+      );
+      console.log('✅ Conciliació guardada:', tipus);
+    } catch (error) {
+      console.error('❌ Error guardant conciliació:', error);
+    }
+  };
+
+  // ELIMINAR conciliació
+  const deleteConciliacio = async (facturaHash) => {
+    try {
+      await supabase.from('conciliacions').delete().eq('factura_hash', facturaHash);
+      console.log('✅ Conciliació eliminada');
+    } catch (error) {
+      console.error('❌ Error eliminant:', error);
+    }
+  };
+
+  // CARREGAR dades i conciliacions
   useEffect(() => {
     const fetchData = async () => {
-      const { data } = await supabase.from('registres_comptables').select('*');
-      if (data) {
-        const facturesData = data.filter(d => d.tipus === 'factura');
-        const bancData = data.filter(d => d.tipus === 'banc');
+      // Carregar registres
+      const { data: registres } = await supabase.from('registres_comptables').select('*');
+      
+      // Carregar conciliacions
+      const { data: conciliacions } = await supabase.from('conciliacions').select('*');
+      
+      if (registres) {
+        const facturesData = registres.filter(d => d.tipus === 'factura');
+        const bancData = registres.filter(d => d.tipus === 'banc');
         
-        // Carregar factures i moviments
         const invoicesList = facturesData.map(d => d.contingut);
         const bankList = bancData.map(d => d.contingut);
         
         setInvoices(invoicesList);
         setBankData(bankList);
         
-        // Reconstruir matches, cash i exclusions
+        // Crear mapa de hash -> índex
+        const invHashToIdx = new Map();
+        invoicesList.forEach((inv, idx) => {
+          invHashToIdx.set(getRecordHash(inv, 'factura'), idx);
+        });
+        
+        const bankHashToIdx = new Map();
+        bankList.forEach((bank, idx) => {
+          bankHashToIdx.set(getRecordHash(bank, 'banc'), idx);
+        });
+        
+        // Reconstruir estat
         const newMatches = {};
         const newCash = new Set();
         const newExclusions = new Set();
         
-        facturesData.forEach((rec, idx) => {
-          if (rec.estat_conciliacio === 'conciliat' && rec.conciliat_amb) {
-            // Trobar l'índex del moviment bancari
-            const bankIdx = bankList.findIndex(b => getRecordHash(b, 'banc') === rec.conciliat_amb);
-            if (bankIdx !== -1) {
-              newMatches[idx] = bankIdx;
+        if (conciliacions) {
+          conciliacions.forEach(conc => {
+            const invIdx = invHashToIdx.get(conc.factura_hash);
+            
+            if (invIdx !== undefined) {
+              if (conc.tipus_conciliacio === 'banc' && conc.banc_hash) {
+                const bankIdx = bankHashToIdx.get(conc.banc_hash);
+                if (bankIdx !== undefined) {
+                  newMatches[invIdx] = bankIdx;
+                }
+              } else if (conc.tipus_conciliacio === 'cash') {
+                newCash.add(invIdx);
+              } else if (conc.tipus_conciliacio === 'exclos') {
+                const bankIdx = bankHashToIdx.get(conc.factura_hash); // En aquest cas és un hash de banc
+                if (bankIdx !== undefined) {
+                  newExclusions.add(bankIdx);
+                }
+              }
             }
-          } else if (rec.estat_conciliacio === 'cash') {
-            newCash.add(idx);
-          }
-        });
-        
-        bancData.forEach((rec, idx) => {
-          if (rec.estat_conciliacio === 'exclos') {
-            newExclusions.add(idx);
-          }
-        });
+          });
+        }
         
         setMatches(newMatches);
         setInvoiceCash(newCash);
         setBankExclusions(newExclusions);
+        
+        console.log('📊 Dades carregades:', {
+          factures: invoicesList.length,
+          banc: bankList.length,
+          matches: Object.keys(newMatches).length,
+          cash: newCash.size,
+          exclusions: newExclusions.size
+        });
       }
     };
     fetchData();
   }, []);
 
-  // --- UTILS DATA ---
   const getQuarter = (d) => {
     if (!d || typeof d !== 'string' || (!d.includes('/') && !d.includes('-'))) return -1;
     const cleanD = d.trim().replace(/-/g, '/');
@@ -147,7 +196,6 @@ export default function ReconciliationTool() {
     return Math.abs(parseFloat(s)) || 0;
   };
 
-  // --- FILTRES ---
   const filteredInvoices = useMemo(() => {
     return invoices.filter(inv => {
       const d = inv[COL_FAC_DATA];
@@ -164,19 +212,18 @@ export default function ReconciliationTool() {
 
   const filteredMatchesList = useMemo(() => {
     return Object.entries(matches).filter(([invIdx]) => {
-      const d = invoices[invIdx][COL_FAC_DATA];
-      return getYear(d) === selectedYear && selectedQuarters.includes(getQuarter(d));
+      const d = invoices[invIdx]?.[COL_FAC_DATA];
+      return d && getYear(d) === selectedYear && selectedQuarters.includes(getQuarter(d));
     });
   }, [matches, invoices, selectedYear, selectedQuarters]);
 
   const filteredCashList = useMemo(() => {
     return [...invoiceCash].filter(invIdx => {
-      const d = invoices[invIdx][COL_FAC_DATA];
-      return getYear(d) === selectedYear && selectedQuarters.includes(getQuarter(d));
+      const d = invoices[invIdx]?.[COL_FAC_DATA];
+      return d && getYear(d) === selectedYear && selectedQuarters.includes(getQuarter(d));
     });
   }, [invoiceCash, invoices, selectedYear, selectedQuarters]);
 
-  // --- CONCILIACIÓ AUTOMÀTICA AMB RESUM ---
   const handleAutoReconcile = async () => {
     const newMatches = { ...matches };
     const usedBank = new Set([...Object.values(matches), ...bankExclusions]);
@@ -194,11 +241,10 @@ export default function ReconciliationTool() {
         usedBank.add(bIdx);
         trobadesNoves++;
         
-        // Guardar a Supabase
-        const bankHash = getRecordHash(bankData[bIdx], 'banc');
+        // Guardar
         const invHash = getRecordHash(inv, 'factura');
-        await syncSupabase('factura', inv, 'conciliat', bankHash);
-        await syncSupabase('banc', bankData[bIdx], 'conciliat', invHash);
+        const bankHash = getRecordHash(bankData[bIdx], 'banc');
+        await saveConciliacio(invHash, bankHash, 'banc');
       }
     }
 
@@ -210,13 +256,9 @@ export default function ReconciliationTool() {
         return newMatches[idx] !== undefined || invoiceCash.has(idx);
     }).length;
 
-    alert(`RESUM DE CONCILIACIÓ:\n\n` +
-          `✅ Noves parelles trobades ara: ${trobadesNoves}\n` +
-          `📊 Total factures conciliades (Any/T actual): ${jaConciliades}\n` +
-          `⏳ Factures encara pendents: ${totalVisibles - jaConciliades}`);
+    alert(`RESUM:\n✅ Noves: ${trobadesNoves}\n📊 Conciliades: ${jaConciliades}\n⏳ Pendents: ${totalVisibles - jaConciliades}`);
   };
 
-  // --- HANDLERS FITXERS ---
   const handleCSV = (e) => {
     Papa.parse(e.target.files[0], {
       header: true, delimiter: ";", skipEmptyLines: true, transformHeader: h => h.trim(),
@@ -271,9 +313,8 @@ export default function ReconciliationTool() {
     <div className="w-full min-h-screen bg-slate-100 p-2 font-sans text-[11px]">
       <iframe id="ifmcontentstoprint" className="hidden" title="print"></iframe>
 
-      {/* HEADER FIXA */}
       <div className="sticky top-0 z-50 w-full bg-white p-4 rounded-b-xl shadow-md mb-4 border-b flex items-center gap-4 no-print flex-wrap">
-        <h1 className="text-xl font-black text-indigo-700 italic border-r pr-4 uppercase tracking-tighter">FinMatch v7</h1>
+        <h1 className="text-xl font-black text-indigo-700 italic border-r pr-4 uppercase tracking-tighter">FinMatch v8</h1>
         
         <div className="flex gap-1 bg-slate-50 p-1 rounded-lg border items-center">
           <Calendar size={14} className="text-slate-400 mx-1"/>
@@ -307,7 +348,6 @@ export default function ReconciliationTool() {
         </button>
       </div>
 
-      {/* BARRA SELECCIÓ MANUAL */}
       {(selectedInvIndices.size > 0 || selectedBankIdx !== null) && (
         <div className="w-full bg-amber-50 border-2 border-amber-300 p-4 rounded-2xl mb-4 flex justify-between items-center shadow-xl no-print">
           <div className="flex gap-10 items-center">
@@ -330,17 +370,12 @@ export default function ReconciliationTool() {
             <button onClick={async () => {
               const nm = {...matches}; 
               
-              // Guardar cada conciliació a Supabase
               for (const invIdx of selectedInvIndices) {
                 nm[invIdx] = selectedBankIdx;
                 
-                const invoice = invoices[invIdx];
-                const bankRecord = bankData[selectedBankIdx];
-                const bankHash = getRecordHash(bankRecord, 'banc');
-                const invHash = getRecordHash(invoice, 'factura');
-                
-                await syncSupabase('factura', invoice, 'conciliat', bankHash);
-                await syncSupabase('banc', bankRecord, 'conciliat', invHash);
+                const invHash = getRecordHash(invoices[invIdx], 'factura');
+                const bankHash = getRecordHash(bankData[selectedBankIdx], 'banc');
+                await saveConciliacio(invHash, bankHash, 'banc');
               }
               
               setMatches(nm); 
@@ -356,9 +391,7 @@ export default function ReconciliationTool() {
         </div>
       )}
 
-      {/* TAULES GRID */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
-        {/* FACTURES */}
         <div id="win-factures" style={{ resize: 'vertical', height: '600px' }} className="bg-white rounded-xl shadow border flex flex-col overflow-auto min-h-[300px]">
           <div className="p-3 bg-slate-800 text-white flex justify-between items-center no-print sticky top-0 z-20">
              <span className="font-bold ml-2 uppercase text-[10px] tracking-widest">Factures Pendents ({filteredInvoices.length})</span>
@@ -405,12 +438,14 @@ export default function ReconciliationTool() {
                             const n = new Set(invoiceCash);
                             const adding = !n.has(rIdx);
                             
+                            const invHash = getRecordHash(inv, 'factura');
+                            
                             if (adding) {
                               n.add(rIdx);
-                              await syncSupabase('factura', inv, 'cash', null);
+                              await saveConciliacio(invHash, null, 'cash');
                             } else {
                               n.delete(rIdx);
-                              await syncSupabase('factura', inv, 'pendent', null);
+                              await deleteConciliacio(invHash);
                             }
                             
                             setInvoiceCash(n); 
@@ -428,7 +463,6 @@ export default function ReconciliationTool() {
           </div>
         </div>
 
-        {/* BANC */}
         <div id="win-banc" style={{ resize: 'vertical', height: '600px' }} className="bg-white rounded-xl shadow border flex flex-col overflow-auto min-h-[300px]">
           <div className="p-3 bg-indigo-900 text-white flex justify-between items-center no-print text-[10px] sticky top-0 z-20">
             <span className="font-bold ml-2 uppercase tracking-widest">Extracte Bancari ({filteredBank.length})</span>
@@ -463,12 +497,14 @@ export default function ReconciliationTool() {
                             const n = new Set(bankExclusions);
                             const adding = !n.has(rIdx);
                             
+                            const bankHash = getRecordHash(row, 'banc');
+                            
                             if (adding) {
                               n.add(rIdx);
-                              await syncSupabase('banc', row, 'exclos', null);
+                              await saveConciliacio(bankHash, null, 'exclos');
                             } else {
                               n.delete(rIdx);
-                              await syncSupabase('banc', row, 'pendent', null);
+                              await deleteConciliacio(bankHash);
                             }
                             
                             setBankExclusions(n); 
@@ -487,7 +523,6 @@ export default function ReconciliationTool() {
         </div>
       </div>
 
-      {/* RESUM */}
       <div id="win-paired" style={{ resize: 'vertical', height: '350px' }} className="w-full bg-white rounded-xl shadow-2xl border-2 border-emerald-300 overflow-auto mb-12 min-h-[150px] flex flex-col">
         <div className="p-3 bg-emerald-600 text-white flex justify-between items-center no-print sticky top-0 z-20">
           <span className="font-black ml-2 uppercase text-[10px] tracking-widest text-white">Resum de Factures Conciliades</span>
@@ -521,13 +556,15 @@ export default function ReconciliationTool() {
                     <td className="p-2 font-mono">{invoices[idx][COL_FAC_DATA]}</td>
                     <td className="p-2">{invoices[idx][COL_FAC_PROV]}</td>
                     <td className="p-2 text-right font-black border-r border-emerald-100">{invoices[idx][COL_FAC_TOTAL]}€</td>
-                    <td className="p-2 pl-4 text-gray-400 italic" colSpan="2">Pagament realitzat fora de circuit bancari</td>
+                    <td className="p-2 pl-4 text-gray-400 italic" colSpan="2">Pagament fora de circuit bancari</td>
                     <td className="p-2 text-center no-print">
                       <button onClick={async () => { 
                         const n = new Set(invoiceCash); 
                         n.delete(idx); 
                         setInvoiceCash(n);
-                        await syncSupabase('factura', invoices[idx], 'pendent', null);
+                        
+                        const invHash = getRecordHash(invoices[idx], 'factura');
+                        await deleteConciliacio(invHash);
                       }} className="text-rose-500 hover:bg-rose-100 p-1.5 rounded-full transition-colors">
                         <XCircle size={18}/>
                       </button>
@@ -555,12 +592,11 @@ export default function ReconciliationTool() {
                       <td className="p-2 text-center no-print">
                         <button onClick={async () => { 
                           const n={...matches}; 
-                          const bankIdx = n[invIdx];
                           delete n[invIdx]; 
                           setMatches(n);
                           
-                          await syncSupabase('factura', invoices[invIdx], 'pendent', null);
-                          await syncSupabase('banc', bankData[bankIdx], 'pendent', null);
+                          const invHash = getRecordHash(invoices[invIdx], 'factura');
+                          await deleteConciliacio(invHash);
                         }} className="text-rose-500 hover:bg-rose-100 p-1.5 rounded-full transition-colors">
                           <Unlink size={18}/>
                         </button>
