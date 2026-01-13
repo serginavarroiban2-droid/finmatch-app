@@ -26,6 +26,7 @@ export default function ReconciliationTool() {
   const [selectedInvIndices, setSelectedInvIndices] = useState(new Set());
   const [selectedBankIdx, setSelectedBankIdx] = useState(null);
   const [showPaired, setShowPaired] = useState(true);
+  const [loading, setLoading] = useState(false);
 
   const COL_FAC_DATA = "DATA";
   const COL_FAC_NUM = "ULTIMA 4 DIGITS NUMERO FACTURA";
@@ -36,12 +37,77 @@ export default function ReconciliationTool() {
   const COL_BANK_DESC = "Concepto";
   const COL_BANK_IMPORT = "Importe";
 
-  // HASH per identificar registres
+  // HASH més robust
   const getRecordHash = (item, tipus) => {
-    const dateStr = tipus === 'factura' ? item[COL_FAC_DATA] : item[COL_BANK_DATA];
-    const amount = tipus === 'factura' ? item[COL_FAC_TOTAL] : item[COL_BANK_IMPORT];
-    const desc = tipus === 'factura' ? item[COL_FAC_PROV] : item[COL_BANK_DESC];
-    return btoa(`${tipus}-${dateStr}-${amount}-${desc}`).substring(0, 100);
+    try {
+      const dateStr = tipus === 'factura' ? item[COL_FAC_DATA] : item[COL_BANK_DATA];
+      const amount = tipus === 'factura' ? item[COL_FAC_TOTAL] : item[COL_BANK_IMPORT];
+      const desc = tipus === 'factura' ? item[COL_FAC_PROV] : item[COL_BANK_DESC];
+      const str = `${tipus}|${dateStr}|${amount}|${desc}`.substring(0, 200);
+      return btoa(encodeURIComponent(str)).substring(0, 100);
+    } catch (e) {
+      console.error('Error creant hash:', e);
+      return Math.random().toString(36);
+    }
+  };
+
+  // GUARDAR múltiples conciliacions en batch
+  const saveConciliacionsEnMasa = async (conciliacions) => {
+    if (conciliacions.length === 0) return;
+    
+    try {
+      const { data, error } = await supabase
+        .from('conciliacions')
+        .upsert(conciliacions, { 
+          onConflict: 'factura_hash',
+          ignoreDuplicates: false 
+        });
+      
+      if (error) throw error;
+      console.log(`✅ ${conciliacions.length} conciliacions guardades`);
+      return true;
+    } catch (error) {
+      console.error('❌ Error guardant conciliacions en massa:', error);
+      return false;
+    }
+  };
+
+  // GUARDAR UNA conciliació
+  const saveConciliacio = async (facturaHash, bancHash = null, tipus = 'banc') => {
+    try {
+      const { error } = await supabase.from('conciliacions').upsert(
+        [{
+          factura_hash: facturaHash,
+          banc_hash: bancHash,
+          tipus_conciliacio: tipus
+        }],
+        { onConflict: 'factura_hash' }
+      );
+      
+      if (error) throw error;
+      console.log('✅ Conciliació guardada:', tipus);
+      return true;
+    } catch (error) {
+      console.error('❌ Error guardant conciliació:', error);
+      return false;
+    }
+  };
+
+  // ELIMINAR conciliació
+  const deleteConciliacio = async (facturaHash) => {
+    try {
+      const { error } = await supabase
+        .from('conciliacions')
+        .delete()
+        .eq('factura_hash', facturaHash);
+      
+      if (error) throw error;
+      console.log('✅ Conciliació eliminada');
+      return true;
+    } catch (error) {
+      console.error('❌ Error eliminant:', error);
+      return false;
+    }
   };
 
   // GUARDAR registre a Supabase
@@ -66,107 +132,102 @@ export default function ReconciliationTool() {
         );
       } catch (error) {
         if (error.code !== '23505') {
-          console.error('Error guardant:', error);
+          console.error('Error guardant registre:', error);
         }
       }
-    }
-  };
-
-  // GUARDAR conciliació
-  const saveConciliacio = async (facturaHash, bancHash = null, tipus = 'banc') => {
-    try {
-      await supabase.from('conciliacions').upsert(
-        [{
-          factura_hash: facturaHash,
-          banc_hash: bancHash,
-          tipus_conciliacio: tipus
-        }],
-        { onConflict: 'factura_hash' }
-      );
-      console.log('✅ Conciliació guardada:', tipus);
-    } catch (error) {
-      console.error('❌ Error guardant conciliació:', error);
-    }
-  };
-
-  // ELIMINAR conciliació
-  const deleteConciliacio = async (facturaHash) => {
-    try {
-      await supabase.from('conciliacions').delete().eq('factura_hash', facturaHash);
-      console.log('✅ Conciliació eliminada');
-    } catch (error) {
-      console.error('❌ Error eliminant:', error);
     }
   };
 
   // CARREGAR dades i conciliacions
   useEffect(() => {
     const fetchData = async () => {
-      // Carregar registres
-      const { data: registres } = await supabase.from('registres_comptables').select('*');
-      
-      // Carregar conciliacions
-      const { data: conciliacions } = await supabase.from('conciliacions').select('*');
-      
-      if (registres) {
-        const facturesData = registres.filter(d => d.tipus === 'factura');
-        const bancData = registres.filter(d => d.tipus === 'banc');
+      setLoading(true);
+      try {
+        // Carregar registres
+        const { data: registres, error: errorRegistres } = await supabase
+          .from('registres_comptables')
+          .select('*');
         
-        const invoicesList = facturesData.map(d => d.contingut);
-        const bankList = bancData.map(d => d.contingut);
+        if (errorRegistres) throw errorRegistres;
         
-        setInvoices(invoicesList);
-        setBankData(bankList);
+        // Carregar conciliacions
+        const { data: conciliacions, error: errorConc } = await supabase
+          .from('conciliacions')
+          .select('*');
         
-        // Crear mapa de hash -> índex
-        const invHashToIdx = new Map();
-        invoicesList.forEach((inv, idx) => {
-          invHashToIdx.set(getRecordHash(inv, 'factura'), idx);
-        });
+        if (errorConc) throw errorConc;
         
-        const bankHashToIdx = new Map();
-        bankList.forEach((bank, idx) => {
-          bankHashToIdx.set(getRecordHash(bank, 'banc'), idx);
-        });
-        
-        // Reconstruir estat
-        const newMatches = {};
-        const newCash = new Set();
-        const newExclusions = new Set();
-        
-        if (conciliacions) {
-          conciliacions.forEach(conc => {
-            const invIdx = invHashToIdx.get(conc.factura_hash);
+        if (registres) {
+          const facturesData = registres.filter(d => d.tipus === 'factura');
+          const bancData = registres.filter(d => d.tipus === 'banc');
+          
+          const invoicesList = facturesData.map(d => d.contingut);
+          const bankList = bancData.map(d => d.contingut);
+          
+          setInvoices(invoicesList);
+          setBankData(bankList);
+          
+          // Crear mapa de hash -> índex
+          const invHashToIdx = new Map();
+          invoicesList.forEach((inv, idx) => {
+            invHashToIdx.set(getRecordHash(inv, 'factura'), idx);
+          });
+          
+          const bankHashToIdx = new Map();
+          bankList.forEach((bank, idx) => {
+            bankHashToIdx.set(getRecordHash(bank, 'banc'), idx);
+          });
+          
+          // Reconstruir estat
+          const newMatches = {};
+          const newCash = new Set();
+          const newExclusions = new Set();
+          
+          if (conciliacions) {
+            console.log(`📥 Carregant ${conciliacions.length} conciliacions...`);
             
-            if (invIdx !== undefined) {
+            conciliacions.forEach(conc => {
               if (conc.tipus_conciliacio === 'banc' && conc.banc_hash) {
+                // Conciliació banc-factura
+                const invIdx = invHashToIdx.get(conc.factura_hash);
                 const bankIdx = bankHashToIdx.get(conc.banc_hash);
-                if (bankIdx !== undefined) {
+                
+                if (invIdx !== undefined && bankIdx !== undefined) {
                   newMatches[invIdx] = bankIdx;
                 }
               } else if (conc.tipus_conciliacio === 'cash') {
-                newCash.add(invIdx);
+                // Pagament en cash
+                const invIdx = invHashToIdx.get(conc.factura_hash);
+                if (invIdx !== undefined) {
+                  newCash.add(invIdx);
+                }
               } else if (conc.tipus_conciliacio === 'exclos') {
-                const bankIdx = bankHashToIdx.get(conc.factura_hash); // En aquest cas és un hash de banc
+                // Moviment bancari sense factura
+                const bankIdx = bankHashToIdx.get(conc.factura_hash);
                 if (bankIdx !== undefined) {
                   newExclusions.add(bankIdx);
                 }
               }
-            }
+            });
+          }
+          
+          setMatches(newMatches);
+          setInvoiceCash(newCash);
+          setBankExclusions(newExclusions);
+          
+          console.log('📊 Estat carregat:', {
+            factures: invoicesList.length,
+            banc: bankList.length,
+            matches: Object.keys(newMatches).length,
+            cash: newCash.size,
+            exclusions: newExclusions.size
           });
         }
-        
-        setMatches(newMatches);
-        setInvoiceCash(newCash);
-        setBankExclusions(newExclusions);
-        
-        console.log('📊 Dades carregades:', {
-          factures: invoicesList.length,
-          banc: bankList.length,
-          matches: Object.keys(newMatches).length,
-          cash: newCash.size,
-          exclusions: newExclusions.size
-        });
+      } catch (error) {
+        console.error('❌ Error carregant dades:', error);
+        alert('Error carregant dades de Supabase. Comprova la connexió.');
+      } finally {
+        setLoading(false);
       }
     };
     fetchData();
@@ -224,39 +285,76 @@ export default function ReconciliationTool() {
     });
   }, [invoiceCash, invoices, selectedYear, selectedQuarters]);
 
+  // CONCILIACIÓ AUTOMÀTICA OPTIMITZADA
   const handleAutoReconcile = async () => {
-    const newMatches = { ...matches };
-    const usedBank = new Set([...Object.values(matches), ...bankExclusions]);
-    let trobadesNoves = 0;
+    setLoading(true);
+    const startTime = Date.now();
+    
+    try {
+      const newMatches = { ...matches };
+      const usedBank = new Set([...Object.values(matches), ...bankExclusions]);
+      const conciliacionsPerGuardar = [];
+      let trobadesNoves = 0;
 
-    for (const inv of filteredInvoices) {
-      const rIdx = invoices.indexOf(inv);
-      if (newMatches[rIdx] || invoiceCash.has(rIdx)) continue;
-      
-      const amt = parseAmount(inv[COL_FAC_TOTAL]);
-      const bIdx = bankData.findIndex((b, j) => !usedBank.has(j) && Math.abs(amt - parseAmount(b[COL_BANK_IMPORT])) <= TOLERANCIA);
-      
-      if (bIdx !== -1) {
-        newMatches[rIdx] = bIdx;
-        usedBank.add(bIdx);
-        trobadesNoves++;
+      // Trobar parelles
+      for (const inv of filteredInvoices) {
+        const rIdx = invoices.indexOf(inv);
+        if (newMatches[rIdx] || invoiceCash.has(rIdx)) continue;
         
-        // Guardar
-        const invHash = getRecordHash(inv, 'factura');
-        const bankHash = getRecordHash(bankData[bIdx], 'banc');
-        await saveConciliacio(invHash, bankHash, 'banc');
+        const amt = parseAmount(inv[COL_FAC_TOTAL]);
+        const bIdx = bankData.findIndex((b, j) => 
+          !usedBank.has(j) && 
+          Math.abs(amt - parseAmount(b[COL_BANK_IMPORT])) <= TOLERANCIA
+        );
+        
+        if (bIdx !== -1) {
+          newMatches[rIdx] = bIdx;
+          usedBank.add(bIdx);
+          trobadesNoves++;
+          
+          // Preparar per guardar
+          const invHash = getRecordHash(inv, 'factura');
+          const bankHash = getRecordHash(bankData[bIdx], 'banc');
+          conciliacionsPerGuardar.push({
+            factura_hash: invHash,
+            banc_hash: bankHash,
+            tipus_conciliacio: 'banc'
+          });
+        }
       }
+
+      // Guardar TOTES les conciliacions d'un cop
+      if (conciliacionsPerGuardar.length > 0) {
+        const success = await saveConciliacionsEnMasa(conciliacionsPerGuardar);
+        if (!success) {
+          alert('⚠️ Error guardant algunes conciliacions. Torna-ho a provar.');
+          setLoading(false);
+          return;
+        }
+      }
+
+      setMatches(newMatches);
+
+      const totalVisibles = filteredInvoices.length;
+      const jaConciliades = filteredInvoices.filter(inv => {
+          const idx = invoices.indexOf(inv);
+          return newMatches[idx] !== undefined || invoiceCash.has(idx);
+      }).length;
+
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      
+      alert(
+        `✅ CONCILIACIÓ COMPLETADA en ${elapsed}s\n\n` +
+        `🆕 Noves parelles: ${trobadesNoves}\n` +
+        `📊 Total conciliades: ${jaConciliades}\n` +
+        `⏳ Pendents: ${totalVisibles - jaConciliades}`
+      );
+    } catch (error) {
+      console.error('Error en conciliació:', error);
+      alert('❌ Error durant la conciliació. Comprova la consola.');
+    } finally {
+      setLoading(false);
     }
-
-    setMatches(newMatches);
-
-    const totalVisibles = filteredInvoices.length;
-    const jaConciliades = filteredInvoices.filter(inv => {
-        const idx = invoices.indexOf(inv);
-        return newMatches[idx] !== undefined || invoiceCash.has(idx);
-    }).length;
-
-    alert(`RESUM:\n✅ Noves: ${trobadesNoves}\n📊 Conciliades: ${jaConciliades}\n⏳ Pendents: ${totalVisibles - jaConciliades}`);
   };
 
   const handleCSV = (e) => {
@@ -311,10 +409,19 @@ export default function ReconciliationTool() {
 
   return (
     <div className="w-full min-h-screen bg-slate-100 p-2 font-sans text-[11px]">
+      {loading && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[100]">
+          <div className="bg-white p-8 rounded-2xl shadow-2xl flex flex-col items-center gap-4">
+            <div className="animate-spin rounded-full h-16 w-16 border-b-4 border-indigo-600"></div>
+            <p className="text-lg font-bold text-gray-700">Processant...</p>
+          </div>
+        </div>
+      )}
+      
       <iframe id="ifmcontentstoprint" className="hidden" title="print"></iframe>
 
       <div className="sticky top-0 z-50 w-full bg-white p-4 rounded-b-xl shadow-md mb-4 border-b flex items-center gap-4 no-print flex-wrap">
-        <h1 className="text-xl font-black text-indigo-700 italic border-r pr-4 uppercase tracking-tighter">FinMatch v8</h1>
+        <h1 className="text-xl font-black text-indigo-700 italic border-r pr-4 uppercase tracking-tighter">FinMatch v9</h1>
         
         <div className="flex gap-1 bg-slate-50 p-1 rounded-lg border items-center">
           <Calendar size={14} className="text-slate-400 mx-1"/>
@@ -333,12 +440,16 @@ export default function ReconciliationTool() {
           <input type="file" onChange={handleExcel} className="text-[9px] w-40" />
         </div>
 
-        <button onClick={handleAutoReconcile} className="bg-indigo-600 text-white px-5 py-2 rounded-lg font-bold uppercase shadow hover:bg-indigo-700 transition flex items-center gap-2">
-          <Play size={12} fill="currentColor" /> Conciliar Auto
+        <button 
+          onClick={handleAutoReconcile} 
+          disabled={loading}
+          className="bg-indigo-600 text-white px-5 py-2 rounded-lg font-bold uppercase shadow hover:bg-indigo-700 transition flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
+          <Play size={12} fill="currentColor" /> 
+          {loading ? 'Processant...' : 'Conciliar Auto'}
         </button>
 
         <button onClick={() => {
-          const blob = new Blob([JSON.stringify({invoices, bankData, matches, invoiceCash: Array.from(invoiceCash)}, null, 2)], {type: 'application/json'});
+          const blob = new Blob([JSON.stringify({invoices, bankData, matches, invoiceCash: Array.from(invoiceCash), bankExclusions: Array.from(bankExclusions)}, null, 2)], {type: 'application/json'});
           const a = document.createElement('a'); 
           a.href = URL.createObjectURL(blob); 
           a.download = `backup_${selectedYear}.json`; 
@@ -368,20 +479,34 @@ export default function ReconciliationTool() {
           </div>
           <div className="flex gap-3">
             <button onClick={async () => {
-              const nm = {...matches}; 
-              
-              for (const invIdx of selectedInvIndices) {
-                nm[invIdx] = selectedBankIdx;
+              setLoading(true);
+              try {
+                const nm = {...matches}; 
+                const conciliacionsPerGuardar = [];
                 
-                const invHash = getRecordHash(invoices[invIdx], 'factura');
-                const bankHash = getRecordHash(bankData[selectedBankIdx], 'banc');
-                await saveConciliacio(invHash, bankHash, 'banc');
+                for (const invIdx of selectedInvIndices) {
+                  nm[invIdx] = selectedBankIdx;
+                  
+                  const invHash = getRecordHash(invoices[invIdx], 'factura');
+                  const bankHash = getRecordHash(bankData[selectedBankIdx], 'banc');
+                  
+                  conciliacionsPerGuardar.push({
+                    factura_hash: invHash,
+                    banc_hash: bankHash,
+                    tipus_conciliacio: 'banc'
+                  });
+                }
+                
+                // Guardar en batch
+                await saveConciliacionsEnMasa(conciliacionsPerGuardar);
+                
+                setMatches(nm); 
+                setSelectedInvIndices(new Set()); 
+                setSelectedBankIdx(null);
+              } finally {
+                setLoading(false);
               }
-              
-              setMatches(nm); 
-              setSelectedInvIndices(new Set()); 
-              setSelectedBankIdx(null);
-            }} disabled={selectedInvIndices.size === 0 || selectedBankIdx === null} className="bg-emerald-600 text-white px-10 py-3 rounded-2xl font-black uppercase shadow-lg hover:bg-emerald-700 transition disabled:opacity-50">
+            }} disabled={selectedInvIndices.size === 0 || selectedBankIdx === null || loading} className="bg-emerald-600 text-white px-10 py-3 rounded-2xl font-black uppercase shadow-lg hover:bg-emerald-700 transition disabled:opacity-50">
               Vincular
             </button>
             <button onClick={() => {setSelectedInvIndices(new Set()); setSelectedBankIdx(null)}} className="bg-white text-amber-800 font-bold px-5 py-3 rounded-2xl border-2 border-amber-200 shadow-sm">
@@ -525,7 +650,9 @@ export default function ReconciliationTool() {
 
       <div id="win-paired" style={{ resize: 'vertical', height: '350px' }} className="w-full bg-white rounded-xl shadow-2xl border-2 border-emerald-300 overflow-auto mb-12 min-h-[150px] flex flex-col">
         <div className="p-3 bg-emerald-600 text-white flex justify-between items-center no-print sticky top-0 z-20">
-          <span className="font-black ml-2 uppercase text-[10px] tracking-widest text-white">Resum de Factures Conciliades</span>
+          <span className="font-black ml-2 uppercase text-[10px] tracking-widest text-white">
+            Resum de Factures Conciliades ({filteredMatchesList.length + filteredCashList.length})
+          </span>
           <div className="flex gap-4 items-center">
             <button onClick={() => printSection('win-paired', 'Informe de Factures Conciliades')} className="p-1.5 hover:bg-emerald-500 rounded-full text-white bg-emerald-700 shadow-inner transition">
               <Printer size={18} />
