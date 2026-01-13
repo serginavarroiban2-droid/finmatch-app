@@ -53,25 +53,52 @@ export default function ReconciliationTool() {
 
   // GUARDAR múltiples conciliacions en batch
   const saveConciliacionsEnMasa = async (conciliacions) => {
-    if (conciliacions.length === 0) return;
-    
-    try {
-      const { data, error } = await supabase
-        .from('conciliacions')
-        .upsert(conciliacions, { 
-          onConflict: 'factura_hash',
-          ignoreDuplicates: false 
-        });
-      
-      if (error) throw error;
-      console.log(`✅ ${conciliacions.length} conciliacions guardades`);
-      return true;
-    } catch (error) {
-      console.error('❌ Error guardant conciliacions en massa:', error);
+  if (conciliacions.length === 0) return true;
+  
+  console.log('💾 Intentant guardar:', conciliacions.length, 'conciliacions');
+  console.log('📦 Primera conciliació:', conciliacions[0]);
+  
+  try {
+    // Verificar que no hi ha valors null on no haurien
+    const validConciliacions = conciliacions.filter(c => {
+      const valid = c.factura_hash && c.tipus_conciliacio;
+      if (!valid) {
+        console.warn('⚠️ Conciliació invàlida:', c);
+      }
+      return valid;
+    });
+
+    if (validConciliacions.length === 0) {
+      console.error('❌ Cap conciliació vàlida!');
       return false;
     }
-  };
 
+    console.log('✅ Conciliacions vàlides:', validConciliacions.length);
+
+    const { data, error } = await supabase
+      .from('conciliacions')
+      .upsert(validConciliacions, { 
+        onConflict: 'factura_hash',
+        ignoreDuplicates: false 
+      });
+    
+    if (error) {
+      console.error('❌ Error de Supabase:', error);
+      console.error('❌ Codi error:', error.code);
+      console.error('❌ Missatge:', error.message);
+      console.error('❌ Detalls:', error.details);
+      throw error;
+    }
+    
+    console.log(`✅ ${validConciliacions.length} conciliacions guardades correctament`);
+    console.log('📊 Resposta:', data);
+    return true;
+  } catch (error) {
+    console.error('❌ Error guardant conciliacions:', error);
+    alert(`Error detallat: ${error.message || JSON.stringify(error)}`);
+    return false;
+  }
+};
   // GUARDAR UNA conciliació
   const saveConciliacio = async (facturaHash, bancHash = null, tipus = 'banc') => {
     try {
