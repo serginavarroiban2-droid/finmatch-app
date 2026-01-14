@@ -37,7 +37,7 @@ export default function ReconciliationTool() {
   const COL_BANK_DESC = "Concepto";
   const COL_BANK_IMPORT = "Importe";
 
-  // HASH més robust
+  // HASH per identificar registres
   const getRecordHash = (item, tipus) => {
     try {
       const dateStr = tipus === 'factura' ? item[COL_FAC_DATA] : item[COL_BANK_DATA];
@@ -53,52 +53,93 @@ export default function ReconciliationTool() {
 
   // GUARDAR múltiples conciliacions en batch
   const saveConciliacionsEnMasa = async (conciliacions) => {
-  if (conciliacions.length === 0) return true;
-  
-  console.log('💾 Intentant guardar:', conciliacions.length, 'conciliacions');
-  console.log('📦 Primera conciliació:', conciliacions[0]);
-  
-  try {
-    // Verificar que no hi ha valors null on no haurien
-    const validConciliacions = conciliacions.filter(c => {
-      const valid = c.factura_hash && c.tipus_conciliacio;
-      if (!valid) {
-        console.warn('⚠️ Conciliació invàlida:', c);
-      }
-      return valid;
-    });
+    if (conciliacions.length === 0) return true;
+    
+    console.log('💾 Intentant guardar:', conciliacions.length, 'conciliacions');
+    
+    try {
+      // Validar i eliminar duplicats
+      const uniqueMap = new Map();
+      
+      conciliacions.forEach(c => {
+        if (c.factura_hash && c.tipus_conciliacio) {
+          // Usar factura_hash com a clau única
+          uniqueMap.set(c.factura_hash, c);
+        } else {
+          console.warn('⚠️ Conciliació invàlida ignorada:', c);
+        }
+      });
 
-    if (validConciliacions.length === 0) {
-      console.error('❌ Cap conciliació vàlida!');
+      const validConciliacions = Array.from(uniqueMap.values());
+
+      if (validConciliacions.length === 0) {
+        console.error('❌ Cap conciliació vàlida!');
+        return false;
+      }
+
+      if (validConciliacions.length < conciliacions.length) {
+        console.warn(`⚠️ ${conciliacions.length - validConciliacions.length} duplicats eliminats`);
+      }
+
+      console.log('✅ Conciliacions úniques:', validConciliacions.length);
+      console.log('📦 Primera conciliació:', validConciliacions[0]);
+
+      // Guardar en batch
+      const { data, error } = await supabase
+        .from('conciliacions')
+        .upsert(validConciliacions, { 
+          onConflict: 'factura_hash',
+          ignoreDuplicates: false 
+        });
+      
+      if (error) {
+        console.error('❌ Error de Supabase:', error);
+        throw error;
+      }
+      
+      console.log(`✅ ${validConciliacions.length} conciliacions guardades correctament`);
+      console.log('📊 Resposta:', data);
+      return true;
+    } catch (error) {
+      console.error('❌ Error guardant conciliacions:', error);
+      
+      // Si encara falla, intentar una a una
+      console.log('🔄 Intentant guardar una a una...');
+      let success = 0;
+      let failed = 0;
+      
+      const uniqueMap = new Map();
+      conciliacions.forEach(c => {
+        if (c.factura_hash && c.tipus_conciliacio) {
+          uniqueMap.set(c.factura_hash, c);
+        }
+      });
+      const validConciliacions = Array.from(uniqueMap.values());
+      
+      for (const conc of validConciliacions) {
+        try {
+          await supabase.from('conciliacions').upsert([conc], { 
+            onConflict: 'factura_hash' 
+          });
+          success++;
+        } catch (e) {
+          console.warn('⚠️ Error guardant:', conc, e.message);
+          failed++;
+        }
+      }
+      
+      console.log(`📊 Resultat: ${success} guardades, ${failed} fallides`);
+      
+      if (success > 0) {
+        alert(`⚠️ Només s'han pogut guardar ${success} de ${validConciliacions.length} conciliacions`);
+        return true;
+      }
+      
+      alert(`❌ Error: ${error.message || 'Error desconegut'}`);
       return false;
     }
+  };
 
-    console.log('✅ Conciliacions vàlides:', validConciliacions.length);
-
-    const { data, error } = await supabase
-      .from('conciliacions')
-      .upsert(validConciliacions, { 
-        onConflict: 'factura_hash',
-        ignoreDuplicates: false 
-      });
-    
-    if (error) {
-      console.error('❌ Error de Supabase:', error);
-      console.error('❌ Codi error:', error.code);
-      console.error('❌ Missatge:', error.message);
-      console.error('❌ Detalls:', error.details);
-      throw error;
-    }
-    
-    console.log(`✅ ${validConciliacions.length} conciliacions guardades correctament`);
-    console.log('📊 Resposta:', data);
-    return true;
-  } catch (error) {
-    console.error('❌ Error guardant conciliacions:', error);
-    alert(`Error detallat: ${error.message || JSON.stringify(error)}`);
-    return false;
-  }
-};
   // GUARDAR UNA conciliació
   const saveConciliacio = async (facturaHash, bancHash = null, tipus = 'banc') => {
     try {
@@ -335,6 +376,16 @@ export default function ReconciliationTool() {
         );
         
         if (bIdx !== -1) {
+          const invAmt = parseAmount(inv[COL_FAC_TOTAL]);
+          const bankAmt = parseAmount(bankData[bIdx][COL_BANK_IMPORT]);
+          const diff = Math.abs(invAmt - bankAmt);
+          
+          console.log('🔗 Parella trobada:', {
+            factura: `${inv[COL_FAC_PROV]} - ${invAmt}€`,
+            banc: `${bankData[bIdx][COL_BANK_DESC]} - ${bankAmt}€`,
+            diferencia: diff
+          });
+          
           newMatches[rIdx] = bIdx;
           usedBank.add(bIdx);
           trobadesNoves++;
@@ -447,8 +498,9 @@ export default function ReconciliationTool() {
       
       <iframe id="ifmcontentstoprint" className="hidden" title="print"></iframe>
 
+      {/* HEADER FIXA */}
       <div className="sticky top-0 z-50 w-full bg-white p-4 rounded-b-xl shadow-md mb-4 border-b flex items-center gap-4 no-print flex-wrap">
-        <h1 className="text-xl font-black text-indigo-700 italic border-r pr-4 uppercase tracking-tighter">FinMatch v9</h1>
+        <h1 className="text-xl font-black text-indigo-700 italic border-r pr-4 uppercase tracking-tighter">FinMatch v10</h1>
         
         <div className="flex gap-1 bg-slate-50 p-1 rounded-lg border items-center">
           <Calendar size={14} className="text-slate-400 mx-1"/>
@@ -463,8 +515,8 @@ export default function ReconciliationTool() {
         </div>
 
         <div className="flex gap-2">
-          <input type="file" onChange={handleCSV} className="text-[9px] w-40" />
-          <input type="file" onChange={handleExcel} className="text-[9px] w-40" />
+          <input type="file" onChange={handleCSV} className="text-[9px] w-40" accept=".csv" />
+          <input type="file" onChange={handleExcel} className="text-[9px] w-40" accept=".xlsx,.xls" />
         </div>
 
         <button 
@@ -486,6 +538,7 @@ export default function ReconciliationTool() {
         </button>
       </div>
 
+      {/* BARRA SELECCIÓ MANUAL */}
       {(selectedInvIndices.size > 0 || selectedBankIdx !== null) && (
         <div className="w-full bg-amber-50 border-2 border-amber-300 p-4 rounded-2xl mb-4 flex justify-between items-center shadow-xl no-print">
           <div className="flex gap-10 items-center">
@@ -543,7 +596,9 @@ export default function ReconciliationTool() {
         </div>
       )}
 
+      {/* TAULES GRID */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+        {/* FACTURES */}
         <div id="win-factures" style={{ resize: 'vertical', height: '600px' }} className="bg-white rounded-xl shadow border flex flex-col overflow-auto min-h-[300px]">
           <div className="p-3 bg-slate-800 text-white flex justify-between items-center no-print sticky top-0 z-20">
              <span className="font-bold ml-2 uppercase text-[10px] tracking-widest">Factures Pendents ({filteredInvoices.length})</span>
@@ -615,6 +670,7 @@ export default function ReconciliationTool() {
           </div>
         </div>
 
+        {/* BANC */}
         <div id="win-banc" style={{ resize: 'vertical', height: '600px' }} className="bg-white rounded-xl shadow border flex flex-col overflow-auto min-h-[300px]">
           <div className="p-3 bg-indigo-900 text-white flex justify-between items-center no-print text-[10px] sticky top-0 z-20">
             <span className="font-bold ml-2 uppercase tracking-widest">Extracte Bancari ({filteredBank.length})</span>
@@ -675,6 +731,7 @@ export default function ReconciliationTool() {
         </div>
       </div>
 
+      {/* RESUM CONCILIACIONS */}
       <div id="win-paired" style={{ resize: 'vertical', height: '350px' }} className="w-full bg-white rounded-xl shadow-2xl border-2 border-emerald-300 overflow-auto mb-12 min-h-[150px] flex flex-col">
         <div className="p-3 bg-emerald-600 text-white flex justify-between items-center no-print sticky top-0 z-20">
           <span className="font-black ml-2 uppercase text-[10px] tracking-widest text-white">
@@ -696,8 +753,10 @@ export default function ReconciliationTool() {
                 <tr>
                   <th className="p-2 w-16 text-center">Tipus</th>
                   <th className="p-2 w-20">Data Fac</th>
+                  <th className="p-2 w-16">Núm. Fac</th>
                   <th className="p-2">Proveïdor</th>
                   <th className="p-2 text-right border-r">Import Fac.</th>
+                  <th className="p-2 w-20">Data Banc</th>
                   <th className="p-2 pl-4">Banc / Alerta</th>
                   <th className="p-2 text-right">Import Banc</th>
                   <th className="p-2 no-print text-center w-14">Acció</th>
@@ -707,10 +766,11 @@ export default function ReconciliationTool() {
                 {filteredCashList.map(idx => (
                   <tr key={`c-${idx}`} className="border-b bg-emerald-50/20 italic text-emerald-900 font-medium">
                     <td className="p-2 font-black text-[9px] text-emerald-600 text-center uppercase tracking-tighter">Cash</td>
-                    <td className="p-2 font-mono">{invoices[idx][COL_FAC_DATA]}</td>
-                    <td className="p-2">{invoices[idx][COL_FAC_PROV]}</td>
+                    <td className="p-2 font-mono text-gray-400">{invoices[idx][COL_FAC_DATA]}</td>
+                    <td className="p-2 font-bold text-gray-600">{invoices[idx][COL_FAC_NUM] || '-'}</td>
+                    <td className="p-2 font-bold">{invoices[idx][COL_FAC_PROV]}</td>
                     <td className="p-2 text-right font-black border-r border-emerald-100">{invoices[idx][COL_FAC_TOTAL]}€</td>
-                    <td className="p-2 pl-4 text-gray-400 italic" colSpan="2">Pagament fora de circuit bancari</td>
+                    <td className="p-2 pl-4 text-gray-400 italic" colSpan="3">Pagament fora de circuit bancari</td>
                     <td className="p-2 text-center no-print">
                       <button onClick={async () => { 
                         const n = new Set(invoiceCash); 
@@ -731,16 +791,20 @@ export default function ReconciliationTool() {
                   return (
                     <tr key={invIdx} className="border-b hover:bg-emerald-50 font-medium transition-colors">
                       <td className="p-2 font-black text-blue-800 text-[9px] text-center uppercase tracking-tighter">Banc</td>
-                      <td className="p-2 font-mono text-gray-400">T{qInv} - {invoices[invIdx][COL_FAC_DATA]}</td>
+                      <td className="p-2 font-mono text-gray-400">{invoices[invIdx][COL_FAC_DATA]}</td>
+                      <td className="p-2 font-bold text-indigo-600">{invoices[invIdx][COL_FAC_NUM] || '-'}</td>
                       <td className="p-2 font-bold">{invoices[invIdx][COL_FAC_PROV]}</td>
                       <td className="p-2 text-right font-black border-r">{invoices[invIdx][COL_FAC_TOTAL]}€</td>
-                      <td className="p-2 pl-4 flex items-center gap-2">
+                      <td className="p-2 font-mono text-gray-400">
                         {qInv !== qBank && (
-                          <span className="print-alert flex items-center gap-1 bg-rose-600 text-white px-2 py-0.5 rounded-full text-[8px] font-black shadow-sm">
-                            <AlertCircle size={10}/> T{qBank}
+                          <span className="inline-flex items-center gap-1 bg-rose-600 text-white px-1 py-0.5 rounded text-[8px] font-black mr-1">
+                            <AlertCircle size={8}/> T{qBank}
                           </span>
                         )}
-                        <span className="italic text-gray-500 truncate max-w-xs">{String(bankData[bIdx][COL_BANK_DESC])}</span>
+                        {bankData[bIdx][COL_BANK_DATA]}
+                      </td>
+                      <td className="p-2 pl-4">
+                        <span className="italic text-gray-500 truncate max-w-xs block">{String(bankData[bIdx][COL_BANK_DESC])}</span>
                       </td>
                       <td className="p-2 text-right font-black text-rose-700">{bankData[bIdx][COL_BANK_IMPORT]}€</td>
                       <td className="p-2 text-center no-print">
