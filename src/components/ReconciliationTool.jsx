@@ -270,7 +270,8 @@ export default function ReconciliationTool() {
                   newCash.add(invIdx);
                 }
               } else if (conc.tipus_conciliacio === 'exclos') {
-                // Moviment bancari sense factura
+                // Moviment bancari sense factura - CORRECCIÓ IMPORTANT!
+                // Ara guardem el hash del banc al camp factura_hash
                 const bankIdx = bankHashToIdx.get(conc.factura_hash);
                 if (bankIdx !== undefined) {
                   newExclusions.add(bankIdx);
@@ -352,6 +353,42 @@ export default function ReconciliationTool() {
       return d && getYear(d) === selectedYear && selectedQuarters.includes(getQuarter(d));
     });
   }, [invoiceCash, invoices, selectedYear, selectedQuarters]);
+
+  // NOUS COMPTADORS - FACTURES
+  const invoiceStats = useMemo(() => {
+    const conciliades = filteredInvoices.filter((inv, i) => {
+      const rIdx = invoices.indexOf(inv);
+      return matches[rIdx] !== undefined || invoiceCash.has(rIdx);
+    }).length;
+    
+    return {
+      totals: filteredInvoices.length,
+      conciliades: conciliades,
+      pendents: filteredInvoices.length - conciliades
+    };
+  }, [filteredInvoices, invoices, matches, invoiceCash]);
+
+  // NOUS COMPTADORS - BANC
+  const bankStats = useMemo(() => {
+    const conciliades = filteredBank.filter((row, i) => {
+      const rIdx = bankData.indexOf(row);
+      return Object.values(matches).includes(rIdx) || bankExclusions.has(rIdx);
+    }).length;
+    
+    return {
+      totals: filteredBank.length,
+      conciliades: conciliades,
+      pendents: filteredBank.length - conciliades
+    };
+  }, [filteredBank, bankData, matches, bankExclusions]);
+
+  // FILTRAR MOVIMENTS BANCARIS SENSE FACTURA (SF)
+  const filteredBankExclusionsList = useMemo(() => {
+    return [...bankExclusions].filter(bankIdx => {
+      const d = bankData[bankIdx]?.[COL_BANK_DATA];
+      return d && getYear(d) === selectedYear && selectedQuarters.includes(getQuarter(d));
+    });
+  }, [bankExclusions, bankData, selectedYear, selectedQuarters]);
 
   // CONCILIACIÓ AUTOMÀTICA OPTIMITZADA
   const handleAutoReconcile = async () => {
@@ -454,16 +491,70 @@ export default function ReconciliationTool() {
     reader.onload = (evt) => {
       const wb = XLSX.read(new Uint8Array(evt.target.result), { type: 'array' });
       const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: "" });
-      const hIdx = rows.findIndex(r => r.some(c => String(c).trim() === COL_BANK_DATA));
+      
+      console.log('📄 Total files llegides:', rows.length);
+      
+      // MILLORA: Buscar la fila que conté les capçaleres
+      // Busquem la fila que conté "F. Operativa", "Concepto", "Importe"
+      const hIdx = rows.findIndex(r => {
+        const rowStr = r.map(c => String(c).trim().toLowerCase()).join('|');
+        return rowStr.includes('f. operativa') || rowStr.includes('f.operativa');
+      });
+      
+      console.log('📍 Fila amb capçaleres trobada a:', hIdx);
+      
       if (hIdx !== -1) {
         const h = rows[hIdx].map(x => String(x).trim());
-        const news = rows.slice(hIdx + 1).filter(r => r.some(c => String(c).trim() !== "")).map(r => {
-          const obj = {}; 
-          h.forEach((col, i) => obj[col] = String(r[i] || "").trim());
-          syncSupabase('banc', obj); 
-          return obj;
-        });
-        setBankData(prev => [...prev, ...news]);
+        console.log('📋 Capçaleres detectades:', h);
+        
+        // Processar només les files de dades (després de la capçalera)
+        const dataRows = rows.slice(hIdx + 1);
+        console.log('📊 Files de dades a processar:', dataRows.length);
+        
+        const news = dataRows
+          .filter(r => {
+            // Filtrar files buides i files sense data vàlida
+            const hasContent = r.some(c => String(c).trim() !== "");
+            const firstCol = String(r[0] || "").trim();
+            
+            // Comprovar si la primera columna sembla una data (format DD/MM/YYYY)
+            const isDate = /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(firstCol);
+            
+            return hasContent && isDate;
+          })
+          .map(r => {
+            const obj = {}; 
+            h.forEach((col, i) => {
+              if (col) { // Només processar columnes amb nom
+                obj[col] = String(r[i] || "").trim();
+              }
+            });
+            
+            // Verificar que té les columnes essencials
+            if (obj[COL_BANK_DATA] && obj[COL_BANK_DESC]) {
+              console.log('✅ Registre vàlid:', {
+                data: obj[COL_BANK_DATA],
+                desc: obj[COL_BANK_DESC]?.substring(0, 30) + '...',
+                import: obj[COL_BANK_IMPORT]
+              });
+              syncSupabase('banc', obj);
+              return obj;
+            }
+            return null;
+          })
+          .filter(obj => obj !== null);
+        
+        console.log('✅ Registres bancaris carregats:', news.length);
+        
+        if (news.length === 0) {
+          alert('⚠️ No s\'han pogut carregar dades del banc. Comprova el format del fitxer.');
+        } else {
+          setBankData(prev => [...prev, ...news]);
+          alert(`✅ ${news.length} moviments bancaris carregats correctament!`);
+        }
+      } else {
+        console.error('❌ No s\'ha trobat la fila de capçaleres');
+        alert('❌ No s\'ha pogut trobar les capçaleres al fitxer Excel. Comprova que conté "F. Operativa", "Concepto" i "Importe".');
       }
     };
     reader.readAsArrayBuffer(e.target.files[0]);
@@ -500,7 +591,7 @@ export default function ReconciliationTool() {
 
       {/* HEADER FIXA */}
       <div className="sticky top-0 z-50 w-full bg-white p-4 rounded-b-xl shadow-md mb-4 border-b flex items-center gap-4 no-print flex-wrap">
-        <h1 className="text-xl font-black text-indigo-700 italic border-r pr-4 uppercase tracking-tighter">FinMatch v10</h1>
+        <h1 className="text-xl font-black text-indigo-700 italic border-r pr-4 uppercase tracking-tighter">FinMatch v11</h1>
         
         <div className="flex gap-1 bg-slate-50 p-1 rounded-lg border items-center">
           <Calendar size={14} className="text-slate-400 mx-1"/>
@@ -601,7 +692,25 @@ export default function ReconciliationTool() {
         {/* FACTURES */}
         <div id="win-factures" style={{ resize: 'vertical', height: '600px' }} className="bg-white rounded-xl shadow border flex flex-col overflow-auto min-h-[300px]">
           <div className="p-3 bg-slate-800 text-white flex justify-between items-center no-print sticky top-0 z-20">
-             <span className="font-bold ml-2 uppercase text-[10px] tracking-widest">Factures Pendents ({filteredInvoices.length})</span>
+             <div className="flex items-center gap-4">
+               <span className="font-bold uppercase text-[10px] tracking-widest">Factures</span>
+               <div className="flex gap-3 text-[9px] bg-slate-700 px-3 py-1 rounded-lg">
+                 <span className="flex items-center gap-1">
+                   <span className="text-slate-400">Total:</span>
+                   <span className="font-black text-white">{invoiceStats.totals}</span>
+                 </span>
+                 <span className="w-px bg-slate-600"></span>
+                 <span className="flex items-center gap-1">
+                   <span className="text-emerald-400">Conciliades:</span>
+                   <span className="font-black text-emerald-300">{invoiceStats.conciliades}</span>
+                 </span>
+                 <span className="w-px bg-slate-600"></span>
+                 <span className="flex items-center gap-1">
+                   <span className="text-amber-400">Pendents:</span>
+                   <span className="font-black text-amber-300">{invoiceStats.pendents}</span>
+                 </span>
+               </div>
+             </div>
              <button onClick={() => printSection('win-factures', 'Llistat de Factures')} className="p-1 hover:bg-slate-700 rounded transition">
                <Printer size={16} />
              </button>
@@ -673,7 +782,25 @@ export default function ReconciliationTool() {
         {/* BANC */}
         <div id="win-banc" style={{ resize: 'vertical', height: '600px' }} className="bg-white rounded-xl shadow border flex flex-col overflow-auto min-h-[300px]">
           <div className="p-3 bg-indigo-900 text-white flex justify-between items-center no-print text-[10px] sticky top-0 z-20">
-            <span className="font-bold ml-2 uppercase tracking-widest">Extracte Bancari ({filteredBank.length})</span>
+            <div className="flex items-center gap-4">
+              <span className="font-bold uppercase tracking-widest">Extracte Bancari</span>
+              <div className="flex gap-3 text-[9px] bg-indigo-800 px-3 py-1 rounded-lg">
+                <span className="flex items-center gap-1">
+                  <span className="text-indigo-300">Total:</span>
+                  <span className="font-black text-white">{bankStats.totals}</span>
+                </span>
+                <span className="w-px bg-indigo-700"></span>
+                <span className="flex items-center gap-1">
+                  <span className="text-emerald-400">Conciliades:</span>
+                  <span className="font-black text-emerald-300">{bankStats.conciliades}</span>
+                </span>
+                <span className="w-px bg-indigo-700"></span>
+                <span className="flex items-center gap-1">
+                  <span className="text-amber-400">Pendents:</span>
+                  <span className="font-black text-amber-300">{bankStats.pendents}</span>
+                </span>
+              </div>
+            </div>
             <button onClick={() => printSection('win-banc', 'Extracte Bancari')} className="p-1 hover:bg-indigo-800 rounded transition">
               <Printer size={16} />
             </button>
@@ -705,6 +832,7 @@ export default function ReconciliationTool() {
                             const n = new Set(bankExclusions);
                             const adding = !n.has(rIdx);
                             
+                            // CORRECCIÓ IMPORTANT: guardar el hash del banc com a factura_hash
                             const bankHash = getRecordHash(row, 'banc');
                             
                             if (adding) {
@@ -734,9 +862,27 @@ export default function ReconciliationTool() {
       {/* RESUM CONCILIACIONS */}
       <div id="win-paired" style={{ resize: 'vertical', height: '350px' }} className="w-full bg-white rounded-xl shadow-2xl border-2 border-emerald-300 overflow-auto mb-12 min-h-[150px] flex flex-col">
         <div className="p-3 bg-emerald-600 text-white flex justify-between items-center no-print sticky top-0 z-20">
-          <span className="font-black ml-2 uppercase text-[10px] tracking-widest text-white">
-            Resum de Factures Conciliades ({filteredMatchesList.length + filteredCashList.length})
-          </span>
+          <div className="flex items-center gap-4">
+            <span className="font-black uppercase text-[10px] tracking-widest text-white">
+              Resum de Factures Conciliades
+            </span>
+            <div className="flex gap-3 text-[9px] bg-emerald-700 px-3 py-1 rounded-lg">
+              <span className="flex items-center gap-1">
+                <span className="text-emerald-200">Total:</span>
+                <span className="font-black text-white">{filteredMatchesList.length + filteredCashList.length + filteredBankExclusionsList.length}</span>
+              </span>
+              <span className="w-px bg-emerald-600"></span>
+              <span className="flex items-center gap-1">
+                <span className="text-blue-300">Amb factura:</span>
+                <span className="font-black text-white">{filteredMatchesList.length + filteredCashList.length}</span>
+              </span>
+              <span className="w-px bg-emerald-600"></span>
+              <span className="flex items-center gap-1">
+                <span className="text-amber-300">Sense factura:</span>
+                <span className="font-black text-white">{filteredBankExclusionsList.length}</span>
+              </span>
+            </div>
+          </div>
           <div className="flex gap-4 items-center">
             <button onClick={() => printSection('win-paired', 'Informe de Factures Conciliades')} className="p-1.5 hover:bg-emerald-500 rounded-full text-white bg-emerald-700 shadow-inner transition">
               <Printer size={18} />
@@ -763,6 +909,34 @@ export default function ReconciliationTool() {
                 </tr>
               </thead>
               <tbody>
+                {/* MOVIMENTS SENSE FACTURA (SF) */}
+                {filteredBankExclusionsList.map(bankIdx => (
+                  <tr key={`sf-${bankIdx}`} className="border-b bg-orange-50/50 text-orange-900 font-medium">
+                    <td className="p-2 font-black text-[9px] text-orange-600 text-center uppercase tracking-tighter">SF</td>
+                    <td className="p-2 text-gray-400" colSpan="4">
+                      <span className="italic font-bold text-orange-800">Moviment sense factura associada</span>
+                    </td>
+                    <td className="p-2 font-mono text-gray-400">{bankData[bankIdx][COL_BANK_DATA]}</td>
+                    <td className="p-2 pl-4">
+                      <span className="italic text-gray-600 truncate max-w-xs block">{String(bankData[bankIdx][COL_BANK_DESC])}</span>
+                    </td>
+                    <td className="p-2 text-right font-black text-rose-700">{bankData[bankIdx][COL_BANK_IMPORT]}€</td>
+                    <td className="p-2 text-center no-print">
+                      <button onClick={async () => { 
+                        const n = new Set(bankExclusions); 
+                        n.delete(bankIdx); 
+                        setBankExclusions(n);
+                        
+                        const bankHash = getRecordHash(bankData[bankIdx], 'banc');
+                        await deleteConciliacio(bankHash);
+                      }} className="text-rose-500 hover:bg-rose-100 p-1.5 rounded-full transition-colors">
+                        <XCircle size={18}/>
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                
+                {/* PAGAMENTS EN CASH */}
                 {filteredCashList.map(idx => (
                   <tr key={`c-${idx}`} className="border-b bg-emerald-50/20 italic text-emerald-900 font-medium">
                     <td className="p-2 font-black text-[9px] text-emerald-600 text-center uppercase tracking-tighter">Cash</td>
@@ -785,6 +959,8 @@ export default function ReconciliationTool() {
                     </td>
                   </tr>
                 ))}
+                
+                {/* CONCILIACIONS BANC-FACTURA */}
                 {filteredMatchesList.map(([invIdx, bIdx]) => {
                   const qInv = getQuarter(invoices[invIdx][COL_FAC_DATA]);
                   const qBank = getQuarter(bankData[bIdx][COL_BANK_DATA]);
