@@ -188,7 +188,7 @@ export default function ReconciliationTool() {
       const uniqueHash = getRecordHash(item, tipus);
       
       try {
-        await supabase.from('registres_comptables').upsert(
+        const { data, error } = await supabase.from('registres_comptables').upsert(
           [{ 
             tipus, 
             contingut: item, 
@@ -198,11 +198,30 @@ export default function ReconciliationTool() {
           }],
           { onConflict: 'unique_hash' }
         );
-      } catch (error) {
-        if (error.code !== '23505') {
-          console.error('Error guardant registre:', error);
+        
+        if (error && error.code !== '23505') {
+          console.error('❌ Error guardant registre:', error);
+          throw error;
         }
+        
+        return true;
+      } catch (error) {
+        if (error.code !== '23505') { // Ignorar duplicats
+          console.error('❌ Error guardant registre a Supabase:', {
+            tipus,
+            error: error.message,
+            item: { 
+              data: dateStr, 
+              desc: tipus === 'factura' ? item[COL_FAC_PROV] : item[COL_BANK_DESC] 
+            }
+          });
+          throw error;
+        }
+        return true; // Duplicat, però és OK
       }
+    } else {
+      console.warn('⚠️ Any invàlid, no es guarda:', year, dateStr);
+      return false;
     }
   };
 
@@ -473,88 +492,121 @@ export default function ReconciliationTool() {
   };
 
   const handleCSV = (e) => {
+    setLoading(true);
     Papa.parse(e.target.files[0], {
       header: true, delimiter: ";", skipEmptyLines: true, transformHeader: h => h.trim(),
-      complete: (r) => {
-        const news = r.data.map(obj => {
-          Object.keys(obj).forEach(k => obj[k] = typeof obj[k] === 'string' ? obj[k].trim() : obj[k]);
-          syncSupabase('factura', obj); 
-          return obj;
-        });
-        setInvoices(prev => [...prev, ...news]);
+      complete: async (r) => {
+        try {
+          console.log('📥 Processant CSV amb', r.data.length, 'registres');
+          
+          const news = r.data.map(obj => {
+            Object.keys(obj).forEach(k => obj[k] = typeof obj[k] === 'string' ? obj[k].trim() : obj[k]);
+            return obj;
+          });
+          
+          // Guardar TOTS els registres a Supabase en paral·lel
+          console.log('💾 Guardant factures a Supabase...');
+          const promises = news.map(obj => syncSupabase('factura', obj));
+          await Promise.all(promises);
+          
+          console.log('✅ Factures guardades correctament');
+          setInvoices(prev => [...prev, ...news]);
+          
+          alert(`✅ ${news.length} factures carregades i guardades a Supabase!`);
+        } catch (error) {
+          console.error('❌ Error guardant factures:', error);
+          alert('❌ Error guardant les dades a Supabase. Comprova la connexió.');
+        } finally {
+          setLoading(false);
+        }
       }
     });
   };
 
   const handleExcel = (e) => {
+    setLoading(true);
     const reader = new FileReader();
-    reader.onload = (evt) => {
-      const wb = XLSX.read(new Uint8Array(evt.target.result), { type: 'array' });
-      const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: "" });
-      
-      console.log('📄 Total files llegides:', rows.length);
-      
-      // MILLORA: Buscar la fila que conté les capçaleres
-      // Busquem la fila que conté "F. Operativa", "Concepto", "Importe"
-      const hIdx = rows.findIndex(r => {
-        const rowStr = r.map(c => String(c).trim().toLowerCase()).join('|');
-        return rowStr.includes('f. operativa') || rowStr.includes('f.operativa');
-      });
-      
-      console.log('📍 Fila amb capçaleres trobada a:', hIdx);
-      
-      if (hIdx !== -1) {
-        const h = rows[hIdx].map(x => String(x).trim());
-        console.log('📋 Capçaleres detectades:', h);
+    reader.onload = async (evt) => {
+      try {
+        const wb = XLSX.read(new Uint8Array(evt.target.result), { type: 'array' });
+        const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: "" });
         
-        // Processar només les files de dades (després de la capçalera)
-        const dataRows = rows.slice(hIdx + 1);
-        console.log('📊 Files de dades a processar:', dataRows.length);
+        console.log('📄 Total files llegides:', rows.length);
         
-        const news = dataRows
-          .filter(r => {
-            // Filtrar files buides i files sense data vàlida
-            const hasContent = r.some(c => String(c).trim() !== "");
-            const firstCol = String(r[0] || "").trim();
-            
-            // Comprovar si la primera columna sembla una data (format DD/MM/YYYY)
-            const isDate = /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(firstCol);
-            
-            return hasContent && isDate;
-          })
-          .map(r => {
-            const obj = {}; 
-            h.forEach((col, i) => {
-              if (col) { // Només processar columnes amb nom
-                obj[col] = String(r[i] || "").trim();
-              }
-            });
-            
-            // Verificar que té les columnes essencials
-            if (obj[COL_BANK_DATA] && obj[COL_BANK_DESC]) {
-              console.log('✅ Registre vàlid:', {
-                data: obj[COL_BANK_DATA],
-                desc: obj[COL_BANK_DESC]?.substring(0, 30) + '...',
-                import: obj[COL_BANK_IMPORT]
+        // MILLORA: Buscar la fila que conté les capçaleres
+        // Busquem la fila que conté "F. Operativa", "Concepto", "Importe"
+        const hIdx = rows.findIndex(r => {
+          const rowStr = r.map(c => String(c).trim().toLowerCase()).join('|');
+          return rowStr.includes('f. operativa') || rowStr.includes('f.operativa');
+        });
+        
+        console.log('📍 Fila amb capçaleres trobada a:', hIdx);
+        
+        if (hIdx !== -1) {
+          const h = rows[hIdx].map(x => String(x).trim());
+          console.log('📋 Capçaleres detectades:', h);
+          
+          // Processar només les files de dades (després de la capçalera)
+          const dataRows = rows.slice(hIdx + 1);
+          console.log('📊 Files de dades a processar:', dataRows.length);
+          
+          const news = dataRows
+            .filter(r => {
+              // Filtrar files buides i files sense data vàlida
+              const hasContent = r.some(c => String(c).trim() !== "");
+              const firstCol = String(r[0] || "").trim();
+              
+              // Comprovar si la primera columna sembla una data (format DD/MM/YYYY)
+              const isDate = /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(firstCol);
+              
+              return hasContent && isDate;
+            })
+            .map(r => {
+              const obj = {}; 
+              h.forEach((col, i) => {
+                if (col) { // Només processar columnes amb nom
+                  obj[col] = String(r[i] || "").trim();
+                }
               });
-              syncSupabase('banc', obj);
-              return obj;
-            }
-            return null;
-          })
-          .filter(obj => obj !== null);
-        
-        console.log('✅ Registres bancaris carregats:', news.length);
-        
-        if (news.length === 0) {
-          alert('⚠️ No s\'han pogut carregar dades del banc. Comprova el format del fitxer.');
-        } else {
+              
+              // Verificar que té les columnes essencials
+              if (obj[COL_BANK_DATA] && obj[COL_BANK_DESC]) {
+                console.log('✅ Registre vàlid:', {
+                  data: obj[COL_BANK_DATA],
+                  desc: obj[COL_BANK_DESC]?.substring(0, 30) + '...',
+                  import: obj[COL_BANK_IMPORT]
+                });
+                return obj;
+              }
+              return null;
+            })
+            .filter(obj => obj !== null);
+          
+          console.log('✅ Registres bancaris processats:', news.length);
+          
+          if (news.length === 0) {
+            alert('⚠️ No s\'han pogut carregar dades del banc. Comprova el format del fitxer.');
+            setLoading(false);
+            return;
+          }
+          
+          // Guardar TOTS els registres a Supabase en paral·lel
+          console.log('💾 Guardant moviments bancaris a Supabase...');
+          const promises = news.map(obj => syncSupabase('banc', obj));
+          await Promise.all(promises);
+          
+          console.log('✅ Moviments bancaris guardats correctament a Supabase');
           setBankData(prev => [...prev, ...news]);
-          alert(`✅ ${news.length} moviments bancaris carregats correctament!`);
+          alert(`✅ ${news.length} moviments bancaris carregats i guardats a Supabase!`);
+        } else {
+          console.error('❌ No s\'ha trobat la fila de capçaleres');
+          alert('❌ No s\'ha pogut trobar les capçaleres al fitxer Excel. Comprova que conté "F. Operativa", "Concepto" i "Importe".');
         }
-      } else {
-        console.error('❌ No s\'ha trobat la fila de capçaleres');
-        alert('❌ No s\'ha pogut trobar les capçaleres al fitxer Excel. Comprova que conté "F. Operativa", "Concepto" i "Importe".');
+      } catch (error) {
+        console.error('❌ Error processant Excel:', error);
+        alert('❌ Error processant el fitxer Excel: ' + error.message);
+      } finally {
+        setLoading(false);
       }
     };
     reader.readAsArrayBuffer(e.target.files[0]);
